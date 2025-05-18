@@ -1,0 +1,43 @@
+# فایل‌های پایتون
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# فایل‌های محیطی
+.env
+.venv
+env/
+venv/
+ENV/
+
+# پایگاه داده
+*.db
+*.sqlite3
+*.sqlite
+
+# فایل‌های لاگ
+*.log
+
+# فایل‌های IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store 
