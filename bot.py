@@ -4,13 +4,14 @@ import logging
 import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ماژول‌های داخلی
 from config import BOT_CONFIG
 from database import (
     setup_database, check_user_exists, register_user, get_user_profile,
-    register_referral, update_user_balance, get_all_users
+    register_referral, update_user_balance, get_all_users, register_transaction,
+    update_transaction_status, get_transaction_by_message_id, get_user_transactions
 )
 
 # تنظیم لاگینگ
@@ -19,6 +20,12 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# مراحل گفتگو برای افزایش موجودی
+PAYMENT_METHOD, ENTER_AMOUNT, CONFIRM_AMOUNT, SEND_RECEIPT = range(4)
+
+# ذخیره اطلاعات موقت کاربر
+user_payment_data = {}
 
 # تابع برای جدا کردن اعداد سه رقم سه رقم
 def format_number_with_commas(number):
@@ -354,6 +361,145 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
     
+    elif callback_data == "increasebalance^":
+        # منوی افزایش موجودی
+        await query.edit_message_text(
+            "💰 افزایش اعتبار\n\n"
+            "برای افزایش اعتبار حساب خود، می‌توانید از روش پرداخت کارت به کارت استفاده کنید.\n\n"
+            "لطفاً روش پرداخت خود را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 کارت به کارت", callback_data="payment_method^card")],
+                [InlineKeyboardButton("🔄 درگاه آنلاین (غیرفعال)", callback_data="payment_method^online")],
+                [InlineKeyboardButton("❌ لغو", callback_data="userprofile^")]
+            ])
+        )
+    
+    elif callback_data == "payment_method^online":
+        # اطلاع‌رسانی درباره غیرفعال بودن درگاه آنلاین
+        await query.answer("فعلا موقتا غیر فعال است. لطفاً از روش کارت به کارت استفاده کنید.", show_alert=True)
+    
+    elif callback_data == "payment_method^card":
+        # شروع فرآیند پرداخت کارت به کارت
+        user_payment_data[user_id] = {"state": ENTER_AMOUNT}
+        
+        await query.edit_message_text(
+            "💰 افزایش اعتبار با کارت به کارت\n\n"
+            "لطفاً مبلغ مورد نظر خود را به تومان وارد کنید:\n"
+            "(مثال: 50,000)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+            ])
+        )
+        
+        # تنظیم وضعیت گفتگو
+        context.user_data["payment_state"] = ENTER_AMOUNT
+    
+    elif callback_data.startswith("confirm_payment^"):
+        # تأیید مبلغ پرداخت
+        amount = callback_data.split("^")[1]
+        user_payment_data[user_id]["amount"] = amount
+        formatted_amount = format_number_with_commas(amount)
+        
+        await query.edit_message_text(
+            f"✅ تأیید پرداخت\n\n"
+            f"مبلغ {formatted_amount} تومان برای شارژ انتخاب شد.\n\n"
+            f"لطفاً به شماره کارت زیر واریز کرده و سپس اسکرین‌شات رسید پرداخت خود را ارسال کنید:\n\n"
+            f"شماره کارت: 6037991521965867\n"
+            f"به نام: محمد امین چهاردولی\n\n"
+            f"🔹 توجه: بعد از واریز، لطفاً فقط تصویر رسید پرداخت را به صورت عکس واضح ارسال کنید",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+            ])
+        )
+        
+        # تنظیم وضعیت گفتگو
+        context.user_data["payment_state"] = SEND_RECEIPT
+    
+    elif callback_data.startswith("cancel_payment^"):
+        # لغو فرآیند پرداخت
+        if user_id in user_payment_data:
+            del user_payment_data[user_id]
+        
+        await query.edit_message_text(
+            "❌ درخواست افزایش اعتبار لغو شد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("» بازگشت به پروفایل", callback_data="userprofile^")]
+            ])
+        )
+    
+    elif callback_data.startswith("admin_approve_payment^"):
+        # تأیید پرداخت توسط ادمین
+        parts = callback_data.split("^")
+        payment_user_id = int(parts[1])
+        amount = int(parts[2])
+        message_id = int(parts[3])
+        
+        # افزایش موجودی کاربر
+        update_user_balance(payment_user_id, amount)
+        
+        # به‌روزرسانی وضعیت تراکنش
+        update_transaction_status(message_id, "approved")
+        
+        # ارسال پیام به کاربر
+        try:
+            await context.bot.send_message(
+                chat_id=payment_user_id,
+                text=f"✅ پرداخت شما تأیید شد!\n\n"
+                     f"مبلغ {format_number_with_commas(amount)} تومان به اعتبار شما افزوده شد."
+            )
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به کاربر: {e}")
+        
+        # به‌روزرسانی پیام در کانال ادمین
+        await context.bot.edit_message_caption(
+            chat_id=BOT_CONFIG["order-channel-id"],
+            message_id=message_id,
+            caption=f"✅ پرداخت تأیید شد\n\n"
+                 f"کاربر: {payment_user_id}\n"
+                 f"مبلغ: {format_number_with_commas(amount)} تومان\n"
+                 f"وضعیت: تأیید شده توسط ادمین"
+        )
+        
+        # پاسخ به ادمین
+        await query.answer("پرداخت با موفقیت تأیید شد و اعتبار کاربر افزایش یافت.", show_alert=True)
+    
+    elif callback_data.startswith("admin_reject_payment^"):
+        # رد پرداخت توسط ادمین
+        parts = callback_data.split("^")
+        payment_user_id = int(parts[1])
+        message_id = int(parts[3])
+        
+        # به‌روزرسانی وضعیت تراکنش
+        update_transaction_status(message_id, "rejected")
+        
+        # ایجاد لینک برای ادمین جهت ارسال دلیل رد پرداخت
+        reject_link = f"https://t.me/{BOT_CONFIG['bot-username']}?start=reject_{payment_user_id}_{message_id}"
+        
+        # ارسال پیام به ادمین
+        await query.edit_message_text(
+            "لطفاً روی لینک زیر کلیک کنید و دلیل رد پرداخت را وارد کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 ارسال دلیل رد پرداخت", url=reject_link)]
+            ])
+        )
+    
+    elif callback_data.startswith("admin_custom_amount^"):
+        # تأیید با مبلغ دلخواه
+        parts = callback_data.split("^")
+        payment_user_id = int(parts[1])
+        message_id = int(parts[3])
+        
+        # ایجاد لینک برای ادمین جهت وارد کردن مبلغ دلخواه
+        custom_amount_link = f"https://t.me/{BOT_CONFIG['bot-username']}?start=custom_{payment_user_id}_{message_id}"
+        
+        # ارسال پیام به ادمین
+        await query.edit_message_text(
+            "لطفاً روی لینک زیر کلیک کنید و مبلغ دلخواه را وارد کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 وارد کردن مبلغ دلخواه", url=custom_amount_link)]
+            ])
+        )
+    
     elif callback_data == "Invitefriends^":
         # ساخت پیام دعوت
         user_id = query.from_user.id
@@ -431,13 +577,300 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # تابع برای پردازش پیام‌های متنی
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.startswith('/start'):
-        await start(update, context)
-    elif update.message.text.startswith('/admin'):
-        await admin_command(update, context)
-    else:
-        # پاسخ به پیام‌های نامشخص
-        await update.message.reply_text("متوجه نشدم چی گفتی! لطفاً دوباره تلاش کنید. 🤔")
+    user_id = update.effective_user.id
+    
+    # لاگ برای دیباگ
+    logger.info(f"دریافت پیام از کاربر {user_id}")
+    
+    # بررسی وضعیت گفتگو
+    if "payment_state" in context.user_data:
+        payment_state = context.user_data["payment_state"]
+        logger.info(f"وضعیت پرداخت کاربر {user_id}: {payment_state}")
+        
+        if payment_state == ENTER_AMOUNT:
+            # پردازش مبلغ وارد شده
+            message_text = update.message.text
+            try:
+                # حذف کاراکترهای اضافی و تبدیل به عدد
+                amount_text = message_text.replace(",", "").replace("،", "").strip()
+                amount = int(amount_text)
+                
+                if amount < 10000:
+                    await update.message.reply_text(
+                        "❌ مبلغ وارد شده باید حداقل 10,000 تومان باشد.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 تلاش مجدد", callback_data="payment_method^card")],
+                            [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+                        ])
+                    )
+                    return
+                
+                # ذخیره مبلغ
+                user_payment_data[user_id] = {"amount": amount}
+                
+                # نمایش تأیید مبلغ
+                formatted_amount = format_number_with_commas(amount)
+                await update.message.reply_text(
+                    f"💰 تأیید مبلغ شارژ\n\n"
+                    f"مبلغ وارد شده: {formatted_amount} تومان\n\n"
+                    f"در صورت تأیید، روی دکمه «تأیید و پرداخت» کلیک کنید.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ تأیید و پرداخت", callback_data=f"confirm_payment^{amount}")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="cancel_payment^")]
+                    ])
+                )
+                
+                # تنظیم وضعیت گفتگو
+                context.user_data["payment_state"] = CONFIRM_AMOUNT
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ لطفاً یک عدد معتبر وارد کنید. (مثال: 50000)",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 تلاش مجدد", callback_data="payment_method^card")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+                    ])
+                )
+            
+            return
+        
+        elif payment_state == SEND_RECEIPT:
+            # دریافت رسید پرداخت
+            if update.message.photo:
+                logger.info(f"دریافت عکس رسید پرداخت از کاربر {user_id}")
+                try:
+                    # دریافت عکس رسید
+                    photo = update.message.photo[-1]  # بزرگترین نسخه عکس
+                    file_id = photo.file_id
+                    
+                    # دریافت اطلاعات پرداخت
+                    amount = user_payment_data.get(user_id, {}).get("amount", 0)
+                    formatted_amount = format_number_with_commas(amount)
+                    logger.info(f"ارسال عکس رسید پرداخت به کانال ادمین، مبلغ: {formatted_amount}")
+                    
+                    # ارسال پیام تأیید به کاربر
+                    await update.message.reply_text(
+                        "✅ رسید پرداخت شما با موفقیت دریافت شد\n\n"
+                        "پرداخت شما در حال بررسی توسط تیم پشتیبانی است و پس از تأیید، اعتبار به حساب شما افزوده خواهد شد.\n\n"
+                        "این فرآیند معمولاً کمتر از 2 ساعت طول می‌کشد."
+                    )
+                    
+                    # ارسال اطلاعات به کانال ادمین
+                    caption = (
+                        f"💰 درخواست افزایش اعتبار\n\n"
+                        f"کاربر: {user_id}\n"
+                        f"نام کاربری: @{update.effective_user.username or 'ندارد'}\n"
+                        f"مبلغ درخواستی: {formatted_amount} تومان\n"
+                        f"زمان: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+                    )
+                    
+                    # ارسال عکس به کانال ادمین
+                    admin_message = await context.bot.send_photo(
+                        chat_id=BOT_CONFIG["order-channel-id"],
+                        photo=file_id,
+                        caption=caption
+                    )
+                    
+                    # دریافت شناسه پیام
+                    message_id = admin_message.message_id
+                    logger.info(f"شناسه پیام در کانال ادمین: {message_id}")
+                    
+                    # ثبت تراکنش در پایگاه داده
+                    transaction_id = register_transaction(user_id, amount, file_id, message_id)
+                    logger.info(f"تراکنش با شناسه {transaction_id} ثبت شد")
+                    
+                    # اضافه کردن دکمه‌های اینلاین به پیام
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=BOT_CONFIG["order-channel-id"],
+                        message_id=message_id,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ تأیید پرداخت", callback_data=f"admin_approve_payment^{user_id}^{amount}^{message_id}")],
+                            [InlineKeyboardButton("🔄 تأیید با مبلغ دلخواه", callback_data=f"admin_custom_amount^{user_id}^{amount}^{message_id}")],
+                            [InlineKeyboardButton("❌ رد پرداخت", callback_data=f"admin_reject_payment^{user_id}^{amount}^{message_id}")]
+                        ])
+                    )
+                    
+                    # پاک کردن اطلاعات موقت
+                    if user_id in user_payment_data:
+                        del user_payment_data[user_id]
+                    context.user_data.pop("payment_state", None)
+                    
+                except Exception as e:
+                    logger.error(f"خطا در پردازش رسید پرداخت: {e}")
+                    await update.message.reply_text(
+                        "❌ خطایی در پردازش رسید پرداخت رخ داد. لطفاً مجدداً تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 تلاش مجدد", callback_data="payment_method^card")],
+                            [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+                        ])
+                    )
+                
+            else:
+                # اگر عکس ارسال نشده باشد
+                logger.warning(f"کاربر {user_id} پیام متنی به جای عکس رسید ارسال کرد")
+                await update.message.reply_text(
+                    "❌ لطفاً تصویر رسید پرداخت خود را به صورت عکس ارسال کنید.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
+                    ])
+                )
+            
+            return
+    
+    # پردازش دستورات معمولی
+    if update.message.text:
+        message_text = update.message.text
+        
+        if message_text.startswith('/start'):
+            # بررسی پارامترهای خاص در دستور start
+            if "reject_" in message_text:
+                # پردازش رد پرداخت توسط ادمین
+                parts = message_text.split("reject_")[1].split("_")
+                if len(parts) >= 2:
+                    user_id = int(parts[0])
+                    message_id = int(parts[1])
+                    
+                    # تنظیم وضعیت برای دریافت دلیل رد
+                    context.user_data["reject_payment"] = {
+                        "user_id": user_id,
+                        "message_id": message_id
+                    }
+                    
+                    await update.message.reply_text(
+                        "لطفاً دلیل رد پرداخت را وارد کنید:",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="admin_panel^")]
+                        ])
+                    )
+                    return
+                    
+            elif "custom_" in message_text:
+                # پردازش تأیید با مبلغ دلخواه
+                parts = message_text.split("custom_")[1].split("_")
+                if len(parts) >= 2:
+                    user_id = int(parts[0])
+                    message_id = int(parts[1])
+                    
+                    # تنظیم وضعیت برای دریافت مبلغ دلخواه
+                    context.user_data["custom_amount"] = {
+                        "user_id": user_id,
+                        "message_id": message_id
+                    }
+                    
+                    await update.message.reply_text(
+                        "لطفاً مبلغ دلخواه را به تومان وارد کنید:",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="admin_panel^")]
+                        ])
+                    )
+                    return
+            
+            # اجرای دستور start معمولی
+            await start(update, context)
+        
+        elif message_text.startswith('/admin'):
+            await admin_command(update, context)
+        
+        elif "reject_payment" in context.user_data:
+            # پردازش دلیل رد پرداخت
+            reject_data = context.user_data["reject_payment"]
+            user_id = reject_data["user_id"]
+            message_id = reject_data["message_id"]
+            reason = update.message.text
+            
+            # به‌روزرسانی وضعیت تراکنش
+            update_transaction_status(message_id, "rejected", reason)
+            
+            # ارسال پیام به کاربر
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ پرداخت شما رد شد.\n\n"
+                         f"دلیل: {reason}\n\n"
+                         f"در صورت نیاز به راهنمایی بیشتر با پشتیبانی تماس بگیرید."
+                )
+            except Exception as e:
+                logger.error(f"خطا در ارسال پیام به کاربر: {e}")
+            
+            # به‌روزرسانی پیام در کانال ادمین
+            await context.bot.edit_message_caption(
+                chat_id=BOT_CONFIG["order-channel-id"],
+                message_id=message_id,
+                caption=f"❌ پرداخت رد شد\n\n"
+                       f"کاربر: {user_id}\n"
+                       f"دلیل: {reason}\n"
+                       f"وضعیت: رد شده توسط ادمین"
+            )
+            
+            # پاک کردن اطلاعات موقت
+            del context.user_data["reject_payment"]
+            
+            await update.message.reply_text(
+                "✅ پیام رد پرداخت با موفقیت به کاربر ارسال شد.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                ])
+            )
+        
+        elif "custom_amount" in context.user_data:
+            # پردازش مبلغ دلخواه
+            custom_data = context.user_data["custom_amount"]
+            user_id = custom_data["user_id"]
+            message_id = custom_data["message_id"]
+            
+            try:
+                # تبدیل مبلغ وارد شده به عدد
+                amount_text = message_text.replace(",", "").replace("،", "").strip()
+                amount = int(amount_text)
+                
+                # افزایش موجودی کاربر
+                update_user_balance(user_id, amount)
+                
+                # به‌روزرسانی وضعیت تراکنش
+                update_transaction_status(message_id, "approved_custom", f"مبلغ تأیید شده: {amount}")
+                
+                # ارسال پیام به کاربر
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ پرداخت شما تأیید شد!\n\n"
+                             f"مبلغ {format_number_with_commas(amount)} تومان به اعتبار شما افزوده شد."
+                    )
+                except Exception as e:
+                    logger.error(f"خطا در ارسال پیام به کاربر: {e}")
+                
+                # به‌روزرسانی پیام در کانال ادمین
+                await context.bot.edit_message_caption(
+                    chat_id=BOT_CONFIG["order-channel-id"],
+                    message_id=message_id,
+                    caption=f"✅ پرداخت تأیید شد (با مبلغ دلخواه)\n\n"
+                           f"کاربر: {user_id}\n"
+                           f"مبلغ: {format_number_with_commas(amount)} تومان\n"
+                           f"وضعیت: تأیید شده با مبلغ دلخواه"
+                )
+                
+                # پاک کردن اطلاعات موقت
+                del context.user_data["custom_amount"]
+                
+                await update.message.reply_text(
+                    f"✅ مبلغ {format_number_with_commas(amount)} تومان با موفقیت به اعتبار کاربر افزوده شد.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                    ])
+                )
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ لطفاً یک عدد معتبر وارد کنید. (مثال: 50000)",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 تلاش مجدد", callback_data=f"admin_custom_amount^{user_id}^0^{message_id}")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="admin_panel^")]
+                    ])
+                )
+        
+        else:
+            # پاسخ به پیام‌های نامشخص
+            await update.message.reply_text("متوجه نشدم چی گفتی! لطفاً دوباره تلاش کنید. 🤔")
 
 # تابع اصلی
 def main():
@@ -452,6 +885,7 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(button_click))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
     
     # شروع پولینگ
     logger.info(f"ربات {BOT_CONFIG['bot-name']} شروع به کار کرد...")

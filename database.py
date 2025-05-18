@@ -48,6 +48,22 @@ def setup_database():
         )
         ''')
         
+        # ایجاد جدول تراکنش‌ها اگر وجود نداشته باشد
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            file_id TEXT,
+            message_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            admin_note TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -203,4 +219,113 @@ def get_all_users():
         return users
     except Exception as e:
         logger.error(f"خطا در دریافت لیست کاربران: {e}")
+        return []
+
+# تابع برای ثبت تراکنش جدید
+def register_transaction(user_id, amount, file_id, message_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # ثبت تراکنش جدید
+        cursor.execute(
+            "INSERT INTO transactions (user_id, amount, file_id, message_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            (user_id, amount, file_id, message_id)
+        )
+        
+        transaction_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"تراکنش جدید با شناسه {transaction_id} برای کاربر {user_id} ثبت شد")
+        return transaction_id
+    except Exception as e:
+        logger.error(f"خطا در ثبت تراکنش جدید: {e}")
+        return None
+
+# تابع برای به‌روزرسانی وضعیت تراکنش
+def update_transaction_status(message_id, status, admin_note=''):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # به‌روزرسانی وضعیت تراکنش
+        cursor.execute(
+            "UPDATE transactions SET status = ?, admin_note = ?, updated_at = CURRENT_TIMESTAMP WHERE message_id = ?",
+            (status, admin_note, message_id)
+        )
+        
+        # بررسی آیا تراکنشی به‌روزرسانی شد
+        if cursor.rowcount == 0:
+            logger.warning(f"هیچ تراکنشی با شناسه پیام {message_id} یافت نشد")
+            conn.close()
+            return False
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"وضعیت تراکنش با شناسه پیام {message_id} به {status} تغییر یافت")
+        return True
+    except Exception as e:
+        logger.error(f"خطا در به‌روزرسانی وضعیت تراکنش: {e}")
+        return False
+
+# تابع برای دریافت اطلاعات تراکنش با شناسه پیام
+def get_transaction_by_message_id(message_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT id, user_id, amount, file_id, status, admin_note, created_at FROM transactions WHERE message_id = ?",
+            (message_id,)
+        )
+        
+        transaction = cursor.fetchone()
+        conn.close()
+        
+        if transaction:
+            return {
+                "id": transaction[0],
+                "user_id": transaction[1],
+                "amount": transaction[2],
+                "file_id": transaction[3],
+                "status": transaction[4],
+                "admin_note": transaction[5],
+                "created_at": transaction[6]
+            }
+        else:
+            logger.warning(f"هیچ تراکنشی با شناسه پیام {message_id} یافت نشد")
+            return None
+    except Exception as e:
+        logger.error(f"خطا در دریافت اطلاعات تراکنش: {e}")
+        return None
+
+# تابع برای دریافت تاریخچه تراکنش‌های کاربر
+def get_user_transactions(user_id, limit=10):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT id, amount, status, created_at, updated_at FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        )
+        
+        transactions = cursor.fetchall()
+        conn.close()
+        
+        result = []
+        for transaction in transactions:
+            result.append({
+                "id": transaction[0],
+                "amount": transaction[1],
+                "status": transaction[2],
+                "created_at": transaction[3],
+                "updated_at": transaction[4]
+            })
+        
+        return result
+    except Exception as e:
+        logger.error(f"خطا در دریافت تاریخچه تراکنش‌های کاربر: {e}")
         return [] 
