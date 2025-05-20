@@ -685,8 +685,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         message_id=message_id,
                         reply_markup=InlineKeyboardMarkup([
                             [InlineKeyboardButton("✅ تأیید پرداخت", callback_data=f"admin_approve_payment^{user_id}^{amount}^{message_id}")],
-                            [InlineKeyboardButton("🔄 تأیید با مبلغ دلخواه", callback_data=f"admin_custom_amount^{user_id}^{amount}^{message_id}")],
-                            [InlineKeyboardButton("❌ رد پرداخت", callback_data=f"admin_reject_payment^{user_id}^{amount}^{message_id}")]
+                            [InlineKeyboardButton("🔄 تأیید با مبلغ دلخواه", url=f"https://t.me/{BOT_CONFIG['bot-username']}?start=custom_{user_id}_{message_id}")],
+                            [InlineKeyboardButton("❌ رد پرداخت", url=f"https://t.me/{BOT_CONFIG['bot-username']}?start=reject_{user_id}_{message_id}")]
                         ])
                     )
                     
