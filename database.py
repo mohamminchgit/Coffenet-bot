@@ -408,4 +408,175 @@ def get_stats():
         }
     except Exception as e:
         logger.error(f"خطا در دریافت آمار: {e}")
-        return None 
+        return None
+
+def get_top_inviters(limit=10):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT inviter_user_id, COUNT(*) as invites
+            FROM referrals
+            GROUP BY inviter_user_id
+            ORDER BY invites DESC
+            LIMIT ?
+        ''', (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"خطا در دریافت برترین دعوت‌کنندگان: {e}")
+        return []
+
+def get_loyal_users(min_weeks=2):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # هر کاربری که در حداقل min_weeks مختلف تراکنش داشته باشد
+        cursor.execute('''
+            SELECT user_id, COUNT(DISTINCT strftime('%Y-%W', datetime(created_at, 'unixepoch')))
+            FROM transactions
+            GROUP BY user_id
+            HAVING COUNT(DISTINCT strftime('%Y-%W', datetime(created_at, 'unixepoch'))) >= ?
+            ORDER BY COUNT(DISTINCT strftime('%Y-%W', datetime(created_at, 'unixepoch'))) DESC
+        ''', (min_weeks,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"خطا در دریافت کاربران وفادار: {e}")
+        return []
+
+def get_growth_chart(days=14):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT date(datetime(created_at, 'unixepoch')), COUNT(*)
+            FROM users
+            WHERE created_at >= strftime('%s', date('now', ? || ' days'))
+            GROUP BY date(datetime(created_at, 'unixepoch'))
+            ORDER BY date(datetime(created_at, 'unixepoch')) DESC
+            LIMIT ?
+        ''', (-days, days))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows[::-1]  # برعکس برای نمایش از قدیم به جدید
+    except Exception as e:
+        logger.error(f"خطا در دریافت نمودار رشد: {e}")
+        return []
+
+def get_usernames(user_ids):
+    if not user_ids:
+        return {}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        q = f"SELECT user_id, username FROM users WHERE user_id IN ({','.join(['?']*len(user_ids))})"
+        cursor.execute(q, user_ids)
+        rows = cursor.fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in rows}
+    except Exception as e:
+        logger.error(f"خطا در دریافت نام کاربری: {e}")
+        return {}
+
+def get_referrals_by_inviter(inviter_user_id):
+    """
+    دریافت لیست کاربران دعوت‌شده توسط یک دعوت‌کننده خاص
+    خروجی: لیستی از دیکشنری شامل invitee_user_id، username، created_at، referral_date، inviter_cart_amount، invitee_cart_amount
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, u.username, u.created_at, r.referral_date, r.inviter_cart_amount, r.invitee_cart_amount
+            FROM referrals r
+            JOIN users u ON r.invitee_user_id = u.user_id
+            WHERE r.inviter_user_id = ?
+            ORDER BY r.referral_date DESC
+        ''', (inviter_user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            result.append({
+                'invitee_user_id': row[0],
+                'username': row[1],
+                'created_at': row[2],
+                'referral_date': row[3],
+                'inviter_cart_amount': row[4],
+                'invitee_cart_amount': row[5],
+            })
+        return result
+    except Exception as e:
+        logger.error(f"خطا در دریافت لیست دعوت‌شدگان: {e}")
+        return []
+
+def get_top_inviter_by_amount():
+    """
+    کاربری که بیشترین مبلغ پاداش دعوت را دریافت کرده است (بر اساس inviter_cart_amount)
+    خروجی: (user_id, username, total_amount)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, u.username, SUM(r.inviter_cart_amount) as total_amount
+            FROM referrals r
+            JOIN users u ON r.inviter_user_id = u.user_id
+            GROUP BY r.inviter_user_id
+            ORDER BY total_amount DESC
+            LIMIT 1
+        ''')
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0], row[1], row[2]
+        return None
+    except Exception as e:
+        logger.error(f"خطا در دریافت بیشترین مبلغ دعوت: {e}")
+        return None
+
+def get_top_inviter_by_count():
+    """
+    کاربری که بیشترین تعداد دعوت موفق داشته است
+    خروجی: (user_id, username, count)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, u.username, COUNT(r.id) as invite_count
+            FROM referrals r
+            JOIN users u ON r.inviter_user_id = u.user_id
+            GROUP BY r.inviter_user_id
+            ORDER BY invite_count DESC
+            LIMIT 1
+        ''')
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0], row[1], row[2]
+        return None
+    except Exception as e:
+        logger.error(f"خطا در دریافت بیشترین تعداد دعوت: {e}")
+        return None
+
+def get_total_referral_rewards():
+    """
+    مجموع کل پاداش پرداختی به دعوت‌کنندگان و دعوت‌شونده‌ها
+    خروجی: (total_inviter, total_invitee)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT SUM(inviter_cart_amount), SUM(invitee_cart_amount) FROM referrals')
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0] or 0, row[1] or 0
+        return 0, 0
+    except Exception as e:
+        logger.error(f"خطا در دریافت مجموع پاداش دعوت: {e}")
+        return 0, 0 

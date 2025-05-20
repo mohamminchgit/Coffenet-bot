@@ -5,6 +5,13 @@ import re
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import matplotlib.pyplot as plt
+import io
+import matplotlib
+import jdatetime
+from matplotlib import font_manager
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 # ماژول‌های داخلی
 from config import BOT_CONFIG
@@ -12,7 +19,9 @@ from database import (
     setup_database, check_user_exists, register_user, get_user_profile,
     register_referral, update_user_balance, get_all_users, register_transaction,
     update_transaction_status, get_transaction_by_message_id, get_user_transactions,
-    get_card_info, set_card_info, get_stats
+    get_card_info, set_card_info, get_stats, get_top_inviters, get_loyal_users,
+    get_growth_chart, get_usernames, get_referrals_by_inviter,
+    get_top_inviter_by_amount, get_top_inviter_by_count, get_total_referral_rewards
 )
 
 # تنظیم لاگینگ
@@ -579,36 +588,116 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # دستور ادمین برای نمایش آمار
     elif callback_data == "admin_stats^" and user_id == BOT_CONFIG["admin-username"]:
-        # دریافت آمار کاربران
-        try:
-            stats = get_stats()
-            if stats:
-                stats_message = f"📊 آمار ربات {BOT_CONFIG['bot-name']}\n\n"
-                stats_message += f"👥 تعداد کل کاربران: {stats['total_users']}\n"
-                stats_message += f"👤 کاربران امروز: {stats['today_users']}\n"
-                stats_message += f"👤 کاربران دیروز: {stats['yesterday_users']}\n"
-                stats_message += f"👤 کاربران هفته گذشته: {stats['week_users']}\n"
-                stats_message += f"🤝 تعداد کل دعوت‌ها: {stats['total_referrals']}\n"
-                stats_message += f"🟢 کاربران فعال امروز (پرداخت/درخواست): {stats['active_today']}\n"
-                stats_message += f"💰 مجموع موجودی کاربران: {format_number_with_commas(stats['total_balance'])} تومان\n"
-            else:
-                stats_message = "خطا در دریافت آمار!"
-            
-            # ارسال آمار به ادمین
-            await query.edit_message_text(
-                stats_message,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
-                ])
-            )
-        except Exception as e:
-            logger.error(f"خطا در نمایش آمار: {e}")
-            await query.edit_message_text(
-                "خطا در دریافت آمار!",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("» بازگشت", callback_data="userpanel^")]
-                ])
-            )
+        # منوی دسته‌بندی آمار
+        stats_menu = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📈 آمار زمانی و روند رشد", callback_data="admin_stats_time^")],
+            [InlineKeyboardButton("🤝 آمار دعوت و رفرال", callback_data="admin_stats_referral^")],
+            [InlineKeyboardButton("💰 آمار مالی و تراکنش", callback_data="admin_stats_finance^")],
+            [InlineKeyboardButton("👤 آمار رفتار کاربران", callback_data="admin_stats_behavior^")],
+            [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+        ])
+        await query.edit_message_text(
+            "لطفاً یکی از دسته‌های آمار زیر را انتخاب کنید:",
+            reply_markup=stats_menu
+        )
+        return
+
+    elif callback_data == "admin_stats_referral^" and user_id == BOT_CONFIG["admin-username"]:
+        stats = get_stats()
+        top_inviters = get_top_inviters()
+        user_ids = [uid for uid, _ in top_inviters]
+        usernames = get_usernames(user_ids)
+        # آمارهای ویژه
+        top_amount = get_top_inviter_by_amount()
+        top_count = get_top_inviter_by_count()
+        total_inviter, total_invitee = get_total_referral_rewards()
+        msg = "🤝 آمار دعوت و رفرال\n\n"
+        if top_amount:
+            msg += f"🏆 بیشترین درآمد از دعوت: @{top_amount[1] or 'بدون_نام'} ({top_amount[0]}) با {format_number_with_commas(top_amount[2])} تومان\n"
+        if top_count:
+            msg += f"👑 بیشترین دعوت موفق: @{top_count[1] or 'بدون_نام'} ({top_count[0]}) با {top_count[2]} دعوت\n"
+        msg += f"💸 مجموع کل پاداش پرداختی:\n  - دعوت‌کنندگان: {format_number_with_commas(total_inviter)} تومان\n  - دعوت‌شونده‌ها: {format_number_with_commas(total_invitee)} تومان\n\n"
+        msg += "برترین دعوت‌کنندگان:\n"
+        buttons = []
+        for idx, (uid, count) in enumerate(top_inviters, 1):
+            uname = usernames.get(uid, "بدون نام کاربری")
+            msg += f"{idx}. {uname} ({uid}) - {count} دعوت موفق\n"
+            buttons.append([InlineKeyboardButton(f"جزئیات دعوت‌های {uname}", callback_data=f"referral_details^{uid}")])
+        buttons.append([InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")])
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    elif callback_data.startswith("referral_details^") and user_id == BOT_CONFIG["admin-username"]:
+        inviter_id = int(callback_data.split("^")[1])
+        referrals = get_referrals_by_inviter(inviter_id)
+        if not referrals:
+            await query.edit_message_text("این کاربر هیچ دعوت موفقی نداشته است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_stats_referral^")]]))
+            return
+        msg = f"📋 لیست کاربران دعوت‌شده توسط {inviter_id}:\n\n"
+        for idx, ref in enumerate(referrals, 1):
+            uname = ref['username'] or 'بدون نام کاربری'
+            created = datetime.fromtimestamp(ref['created_at']).strftime('%Y/%m/%d') if ref['created_at'] else '-'
+            ref_date = ref['referral_date'][:10] if ref['referral_date'] else '-'
+            msg += f"{idx}. {uname} ({ref['invitee_user_id']}) | ثبت‌نام: {created} | دعوت: {ref_date}\n"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_stats_referral^")]])
+        )
+        return
+
+    elif callback_data == "admin_stats_time^" and user_id == BOT_CONFIG["admin-username"]:
+        stats = get_stats()
+        msg = "📈 آمار زمانی و روند رشد\n\n"
+        msg += f"کاربران امروز: {stats['today_users']}\n"
+        msg += f"کاربران دیروز: {stats['yesterday_users']}\n"
+        msg += f"کاربران هفته گذشته: {stats['week_users']}\n"
+        msg += f"کاربران فعال امروز: {stats['active_today']}\n\n"
+        msg += "برای دریافت نمودار گرافیکی، یکی از بازه‌های زیر را انتخاب کنید:\n"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("نمودار ۱۴ روز اخیر", callback_data="growth_chart^14")],
+                [InlineKeyboardButton("نمودار ۱ ماه اخیر", callback_data="growth_chart^30")],
+                [InlineKeyboardButton("نمودار ۳ ماه اخیر", callback_data="growth_chart^90")],
+                [InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")]
+            ])
+        )
+        return
+
+    elif callback_data == "admin_stats_finance^" and user_id == BOT_CONFIG["admin-username"]:
+        stats = get_stats()
+        msg = "💰 آمار مالی و تراکنش\n\n"
+        msg += f"مجموع موجودی کاربران: {format_number_with_commas(stats['total_balance'])} تومان\n"
+        # می‌توان آمارهای جزئی‌تر را اینجا اضافه کرد (مثلاً مجموع تراکنش‌های موفق)
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")]
+            ])
+        )
+        return
+
+    elif callback_data == "admin_stats_behavior^" and user_id == BOT_CONFIG["admin-username"]:
+        stats = get_stats()
+        loyal_users = get_loyal_users()
+        user_ids = [uid for uid, _ in loyal_users]
+        usernames = get_usernames(user_ids)
+        msg = "👤 آمار رفتار کاربران\n\n"
+        msg += f"تعداد کل کاربران: {stats['total_users']}\n\n"
+        msg += "کاربران وفادار (فعال در حداقل ۲ هفته):\n"
+        for idx, (uid, weeks) in enumerate(loyal_users, 1):
+            uname = usernames.get(uid) or "بدون نام کاربری"
+            msg += f"{idx}. {uname} ({uid}) - {weeks} هفته فعال\n"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")]
+            ])
+        )
+        return
 
     # پنل ادمین
     elif callback_data == "admin_panel^":
@@ -654,6 +743,80 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
             ])
         )
+
+    elif callback_data.startswith("growth_chart^") and user_id == BOT_CONFIG["admin-username"]:
+        matplotlib.rcParams['font.sans-serif'] = ['Tahoma', 'Vazirmatn', 'IRANSans', 'Arial']
+        days = int(callback_data.split("^")[1])
+        growth = get_growth_chart(days)
+        if not growth:
+            await query.edit_message_text("داده‌ای برای رسم نمودار وجود ندارد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_stats_time^")]]))
+            return
+        dates = [jdatetime.date.fromgregorian(date=datetime.strptime(d, "%Y-%m-%d").date()).strftime("%Y/%m/%d") for d, _ in growth]
+        counts = [c for _, c in growth]
+        font_path = "AbarMid-Bold.ttf"
+        prop = font_manager.FontProperties(fname=font_path)
+        def fa(text):
+            return get_display(arabic_reshaper.reshape(text))
+        if days >= 60:
+            # گروه‌بندی بر اساس ماه
+            import collections
+            month_map = collections.OrderedDict()
+            for d, c in growth:
+                date_obj = jdatetime.date.fromgregorian(date=datetime.strptime(d, "%Y-%m-%d").date())
+                key = f"{date_obj.year}/{date_obj.month:02d}"
+                month_map.setdefault(key, 0)
+                month_map[key] += c
+
+            # برچسب محور x را با نام ماه شمسی بساز
+            x_labels = [fa(k) for k in month_map.keys()]
+            y_vals = list(month_map.values())
+
+            fig, ax = plt.subplots(figsize=(9,5))
+            ax.plot(x_labels, y_vals, marker='o', color='#1976D2', linewidth=3, markersize=8, markerfacecolor='#FF9800', markeredgewidth=2)
+            ax.fill_between(x_labels, y_vals, color='#1976D2', alpha=0.08)
+            ax.set_title(fa(f'نمودار رشد کاربران {days} روز اخیر'), fontproperties=prop, fontsize=18, color='#222')
+            ax.set_xlabel(fa('ماه'), fontproperties=prop, fontsize=14, color='#444')
+            ax.set_ylabel(fa('تعداد ثبت‌نام'), fontproperties=prop, fontsize=14, color='#444')
+            ax.tick_params(axis='x', labelsize=13)
+            ax.tick_params(axis='y', labelsize=12)
+            for label in ax.get_xticklabels():
+                label.set_fontproperties(prop)
+            for label in ax.get_yticklabels():
+                label.set_fontproperties(prop)
+            ax.grid(True, linestyle='--', alpha=0.4)
+            fig.patch.set_facecolor('#f7f7fa')
+            plt.tight_layout()
+        else:
+            # حالت روزانه مثل قبل
+            plt.style.use('seaborn-v0_8-darkgrid')
+            fig, ax = plt.subplots(figsize=(9,5))
+            ax.plot(dates, counts, marker='o', color='#1976D2', linewidth=3, markersize=8, markerfacecolor='#FF9800', markeredgewidth=2)
+            ax.fill_between(dates, counts, color='#1976D2', alpha=0.08)
+            ax.set_title(fa(f'نمودار رشد کاربران {days} روز اخیر'), fontproperties=prop, fontsize=18, color='#222')
+            ax.set_xlabel(fa('تاریخ'), fontproperties=prop, fontsize=14, color='#444')
+            ax.set_ylabel(fa('تعداد ثبت‌نام'), fontproperties=prop, fontsize=14, color='#444')
+            ax.tick_params(axis='x', labelrotation=45, labelsize=12)
+            ax.tick_params(axis='y', labelsize=12)
+            for label in ax.get_xticklabels():
+                label.set_fontproperties(prop)
+            for label in ax.get_yticklabels():
+                label.set_fontproperties(prop)
+            ax.grid(True, linestyle='--', alpha=0.4)
+            fig.patch.set_facecolor('#f7f7fa')
+            plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        await query.message.reply_photo(photo=buf, caption=f'نمودار رشد کاربران {days} روز اخیر')
+        buf.close()
+        plt.close()
+        await query.edit_message_text(
+            f"نمودار رشد کاربران {days} روز اخیر ارسال شد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("» بازگشت به آمار زمانی", callback_data="admin_stats_time^")]
+            ])
+        )
+        return
 
 # تابع برای پردازش دستور /admin
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
