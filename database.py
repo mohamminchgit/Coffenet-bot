@@ -372,38 +372,92 @@ def get_stats():
     today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     yesterday_start = today_start - 86400
     week_start = today_start - 7*86400
+    last_week_start = week_start - 7*86400
+    month_start = today_start - 30*86400
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         # کل کاربران
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
+        
         # کاربران امروز
         cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (today_start,))
         today_users = cursor.fetchone()[0]
+        
         # کاربران دیروز
         cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?", (yesterday_start, today_start))
         yesterday_users = cursor.fetchone()[0]
-        # کاربران هفته گذشته
+        
+        # کاربران هفته جاری
         cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (week_start,))
         week_users = cursor.fetchone()[0]
-        # کاربران دعوت شده (referrals)
+        
+        # کاربران هفته گذشته
+        cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?", (last_week_start, week_start))
+        last_week_users = cursor.fetchone()[0]
+        
+        # کاربران ماه گذشته
+        cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (month_start,))
+        month_users = cursor.fetchone()[0]
+        
+        # کاربران دعوت شده (کل)
         cursor.execute("SELECT COUNT(*) FROM referrals")
         total_referrals = cursor.fetchone()[0]
+        
+        # کاربران دعوت شده امروز
+        cursor.execute("""
+            SELECT COUNT(*) FROM referrals 
+            WHERE referral_date >= datetime(?, 'unixepoch')
+        """, (today_start,))
+        today_referrals = cursor.fetchone()[0]
+        
+        # کاربران دعوت شده دیروز
+        cursor.execute("""
+            SELECT COUNT(*) FROM referrals 
+            WHERE referral_date >= datetime(?, 'unixepoch') 
+            AND referral_date < datetime(?, 'unixepoch')
+        """, (yesterday_start, today_start))
+        yesterday_referrals = cursor.fetchone()[0]
+        
+        # کاربران دعوت شده هفته جاری
+        cursor.execute("""
+            SELECT COUNT(*) FROM referrals 
+            WHERE referral_date >= datetime(?, 'unixepoch')
+        """, (week_start,))
+        week_referrals = cursor.fetchone()[0]
+        
         # کاربران فعال امروز (کسانی که تراکنش یا پیام داشته‌اند)
         cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions WHERE created_at >= ?", (today_start,))
         active_today = cursor.fetchone()[0]
+        
+        # کاربران فعال دیروز
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions WHERE created_at >= ? AND created_at < ?", (yesterday_start, today_start))
+        active_yesterday = cursor.fetchone()[0]
+        
+        # کاربران فعال هفته جاری
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions WHERE created_at >= ?", (week_start,))
+        active_week = cursor.fetchone()[0]
+        
         # مجموع موجودی کاربران
         cursor.execute("SELECT SUM(balance) FROM users")
         total_balance = cursor.fetchone()[0] or 0
+        
         conn.close()
         return {
             "total_users": total_users,
             "today_users": today_users,
             "yesterday_users": yesterday_users,
             "week_users": week_users,
+            "last_week_users": last_week_users,
+            "month_users": month_users,
             "total_referrals": total_referrals,
+            "today_referrals": today_referrals,
+            "yesterday_referrals": yesterday_referrals,
+            "week_referrals": week_referrals,
             "active_today": active_today,
+            "active_yesterday": active_yesterday,
+            "active_week": active_week,
             "total_balance": total_balance
         }
     except Exception as e:

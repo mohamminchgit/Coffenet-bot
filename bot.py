@@ -1,28 +1,32 @@
-import os
-import json
 import logging
-import re
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
-import matplotlib.pyplot as plt
+import os
 import io
-import matplotlib
-import jdatetime
-from matplotlib import font_manager
+import json
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import numpy as np
+from datetime import datetime, timedelta
+import time
+import uuid
+import re
 import arabic_reshaper
 from bidi.algorithm import get_display
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import jdatetime
+from matplotlib import font_manager
 
 # ماژول‌های داخلی
-from config import BOT_CONFIG
-from database import (
-    setup_database, check_user_exists, register_user, get_user_profile,
-    register_referral, update_user_balance, get_all_users, register_transaction,
-    update_transaction_status, get_transaction_by_message_id, get_user_transactions,
-    get_card_info, set_card_info, get_stats, get_top_inviters, get_loyal_users,
-    get_growth_chart, get_usernames, get_referrals_by_inviter,
-    get_top_inviter_by_amount, get_top_inviter_by_count, get_total_referral_rewards
-)
+from config import BOT_CONFIG, DB_CONFIG
+from database import (setup_database, check_user_exists, register_user, get_user_profile, 
+                     register_referral, update_user_balance, update_user_phone, get_card_info, 
+                     set_card_info, get_stats, get_top_inviters, get_usernames,
+                     get_referrals_by_inviter, get_top_inviter_by_amount,
+                     get_top_inviter_by_count, get_total_referral_rewards,
+                     get_growth_chart, get_all_users, register_transaction,
+                     update_transaction_status, get_transaction_by_message_id, 
+                     get_user_transactions, get_loyal_users)
 
 # تنظیم لاگینگ
 logging.basicConfig(
@@ -30,6 +34,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# مسیر پایگاه داده
+DB_PATH = DB_CONFIG["db_path"]
 
 # مراحل گفتگو برای افزایش موجودی
 PAYMENT_METHOD, ENTER_AMOUNT, CONFIRM_AMOUNT, SEND_RECEIPT = range(4)
@@ -611,20 +618,45 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_amount = get_top_inviter_by_amount()
         top_count = get_top_inviter_by_count()
         total_inviter, total_invitee = get_total_referral_rewards()
+        
         msg = "🤝 آمار دعوت و رفرال\n\n"
+        msg += f"📊 مجموع کل دعوت‌ها: {stats['total_referrals']}\n"
+        msg += f"• دعوت‌های امروز: {stats['today_referrals']}\n"
+        msg += f"• دعوت‌های دیروز: {stats['yesterday_referrals']}\n"
+        msg += f"• دعوت‌های هفته جاری: {stats['week_referrals']}\n\n"
+        msg += f"🎁 مجموع پاداش پرداختی:\n  - دعوت‌کنندگان: {format_number_with_commas(total_inviter)} تومان\n  - دعوت‌شونده‌ها: {format_number_with_commas(total_invitee)} تومان\n  - مجموع: {format_number_with_commas(total_inviter + total_invitee)} تومان\n\n"
         if top_amount:
             msg += f"🏆 بیشترین درآمد از دعوت: @{top_amount[1] or 'بدون_نام'} ({top_amount[0]}) با {format_number_with_commas(top_amount[2])} تومان\n"
         if top_count:
             msg += f"👑 بیشترین دعوت موفق: @{top_count[1] or 'بدون_نام'} ({top_count[0]}) با {top_count[2]} دعوت\n"
-        msg += f"💸 مجموع کل پاداش پرداختی:\n  - دعوت‌کنندگان: {format_number_with_commas(total_inviter)} تومان\n  - دعوت‌شونده‌ها: {format_number_with_commas(total_invitee)} تومان\n\n"
-        msg += "برترین دعوت‌کنندگان:\n"
-        buttons = []
-        for idx, (uid, count) in enumerate(top_inviters, 1):
+        msg += "\nبرترین دعوت‌کنندگان بر اساس تعداد دعوت:\n"
+        for idx, (uid, count) in enumerate(top_inviters[:5], 1):
             uname = usernames.get(uid, "بدون نام کاربری")
             msg += f"{idx}. {uname} ({uid}) - {count} دعوت موفق\n"
+        # برترین دعوت‌کنندگان بر اساس مبلغ دریافتی
+        # دریافت ۵ نفر برتر بر اساس مبلغ
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, u.username, SUM(r.inviter_cart_amount) as total_amount
+            FROM referrals r
+            JOIN users u ON r.inviter_user_id = u.user_id
+            GROUP BY r.inviter_user_id
+            ORDER BY total_amount DESC
+            LIMIT 5
+        ''')
+        top_by_amount = cursor.fetchall()
+        conn.close()
+        if top_by_amount:
+            msg += "\nبرترین دعوت‌کنندگان بر اساس مبلغ دریافتی:\n"
+            for idx, (uid, uname, amount) in enumerate(top_by_amount, 1):
+                msg += f"{idx}. @{uname or 'بدون_نام'} ({uid}) - {format_number_with_commas(amount)} تومان\n"
+        buttons = []
+        for idx, (uid, count) in enumerate(top_inviters[:5], 1):
+            uname = usernames.get(uid, "بدون نام کاربری")
             buttons.append([InlineKeyboardButton(f"جزئیات دعوت‌های {uname}", callback_data=f"referral_details^{uid}")])
         buttons.append([InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")])
-        await query.edit_message_text(
+            await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -642,7 +674,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             created = datetime.fromtimestamp(ref['created_at']).strftime('%Y/%m/%d') if ref['created_at'] else '-'
             ref_date = ref['referral_date'][:10] if ref['referral_date'] else '-'
             msg += f"{idx}. {uname} ({ref['invitee_user_id']}) | ثبت‌نام: {created} | دعوت: {ref_date}\n"
-        await query.edit_message_text(
+            await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_stats_referral^")]])
         )
@@ -651,10 +683,29 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif callback_data == "admin_stats_time^" and user_id == BOT_CONFIG["admin-username"]:
         stats = get_stats()
         msg = "📈 آمار زمانی و روند رشد\n\n"
-        msg += f"کاربران امروز: {stats['today_users']}\n"
-        msg += f"کاربران دیروز: {stats['yesterday_users']}\n"
-        msg += f"کاربران هفته گذشته: {stats['week_users']}\n"
-        msg += f"کاربران فعال امروز: {stats['active_today']}\n\n"
+        
+        # آمار کاربران جدید
+        msg += "👤 آمار کاربران جدید:\n"
+        msg += f"• کاربران امروز: {stats['today_users']} کاربر\n"
+        msg += f"• کاربران دیروز: {stats['yesterday_users']} کاربر\n"
+        msg += f"• کاربران هفته جاری: {stats['week_users']} کاربر\n"
+        msg += f"• کاربران هفته گذشته: {stats['last_week_users']} کاربر\n"
+        msg += f"• کاربران ماه گذشته: {stats['month_users']} کاربر\n"
+        msg += f"• کل کاربران: {stats['total_users']} کاربر\n\n"
+        
+        # آمار کاربران فعال
+        msg += "🔵 آمار کاربران فعال:\n"
+        msg += f"• کاربران فعال امروز: {stats['active_today']} کاربر\n"
+        msg += f"• کاربران فعال دیروز: {stats['active_yesterday']} کاربر\n"
+        msg += f"• کاربران فعال هفته جاری: {stats['active_week']} کاربر\n\n"
+        
+        # آمار کاربران دعوت شده
+        msg += "🤝 آمار کاربران دعوت شده:\n"
+        msg += f"• دعوت‌های امروز: {stats['today_referrals']} دعوت\n"
+        msg += f"• دعوت‌های دیروز: {stats['yesterday_referrals']} دعوت\n"
+        msg += f"• دعوت‌های هفته جاری: {stats['week_referrals']} دعوت\n"
+        msg += f"• کل دعوت‌ها: {stats['total_referrals']} دعوت\n\n"
+        
         msg += "برای دریافت نمودار گرافیکی، یکی از بازه‌های زیر را انتخاب کنید:\n"
         await query.edit_message_text(
             msg,
@@ -670,8 +721,52 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif callback_data == "admin_stats_finance^" and user_id == BOT_CONFIG["admin-username"]:
         stats = get_stats()
         msg = "💰 آمار مالی و تراکنش\n\n"
-        msg += f"مجموع موجودی کاربران: {format_number_with_commas(stats['total_balance'])} تومان\n"
-        # می‌توان آمارهای جزئی‌تر را اینجا اضافه کرد (مثلاً مجموع تراکنش‌های موفق)
+        
+        # آمار موجودی کاربران
+        msg += "💵 موجودی کاربران:\n"
+        msg += f"• مجموع موجودی کل کاربران: {format_number_with_commas(stats['total_balance'])} تومان\n\n"
+        
+        # آمار پاداش‌های رفرال
+        total_inviter, total_invitee = get_total_referral_rewards()
+        msg += "🎁 پاداش‌های رفرال:\n"
+        msg += f"• مجموع پاداش دعوت‌کنندگان: {format_number_with_commas(total_inviter)} تومان\n"
+        msg += f"• مجموع پاداش دعوت‌شوندگان: {format_number_with_commas(total_invitee)} تومان\n"
+        msg += f"• مجموع کل پاداش‌ها: {format_number_with_commas(total_inviter + total_invitee)} تومان\n\n"
+        
+        # آمار تراکنش‌ها (اضافه کردن کوئری برای دریافت آمار تراکنش‌ها)
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # تعداد تراکنش‌های موفق
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE status = 'approved'")
+        successful_transactions = cursor.fetchone()[0]
+        
+        # مجموع مبلغ تراکنش‌های موفق
+        cursor.execute("SELECT SUM(amount) FROM transactions WHERE status = 'approved'")
+        total_successful_amount = cursor.fetchone()[0] or 0
+        
+        # تعداد تراکنش‌های در انتظار
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE status = 'pending'")
+        pending_transactions = cursor.fetchone()[0]
+        
+        # مجموع مبلغ تراکنش‌های در انتظار
+        cursor.execute("SELECT SUM(amount) FROM transactions WHERE status = 'pending'")
+        total_pending_amount = cursor.fetchone()[0] or 0
+        
+        # تراکنش‌های امروز
+        today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        cursor.execute("SELECT COUNT(*), SUM(amount) FROM transactions WHERE status = 'approved' AND created_at >= ?", (today_start,))
+        result = cursor.fetchone()
+        today_transactions = result[0]
+        today_amount = result[1] or 0
+        
+        conn.close()
+        
+        msg += "💳 آمار تراکنش‌ها:\n"
+        msg += f"• تراکنش‌های موفق امروز: {today_transactions} تراکنش ({format_number_with_commas(today_amount)} تومان)\n"
+        msg += f"• کل تراکنش‌های موفق: {successful_transactions} تراکنش ({format_number_with_commas(total_successful_amount)} تومان)\n"
+        msg += f"• تراکنش‌های در انتظار: {pending_transactions} تراکنش ({format_number_with_commas(total_pending_amount)} تومان)\n"
+        
         await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup([
@@ -682,15 +777,59 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif callback_data == "admin_stats_behavior^" and user_id == BOT_CONFIG["admin-username"]:
         stats = get_stats()
-        loyal_users = get_loyal_users()
-        user_ids = [uid for uid, _ in loyal_users]
-        usernames = get_usernames(user_ids)
+        
+        # دریافت کاربران وفادار (کاربرانی که در حداقل 2 هفته مختلف تراکنش داشته‌اند)
+        loyal_users = get_loyal_users(min_weeks=2)
+        
+        # دریافت اطلاعات تکمیلی از دیتابیس
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # تعداد کاربران با شماره تلفن ثبت شده
+        cursor.execute("SELECT COUNT(*) FROM users WHERE phone_number != ''")
+        users_with_phone = cursor.fetchone()[0]
+        
+        # درصد کاربران با شماره تلفن
+        phone_percentage = round((users_with_phone / stats['total_users']) * 100 if stats['total_users'] > 0 else 0, 1)
+        
+        # تعداد کاربران با حداقل یک تراکنش
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions")
+        users_with_transaction = cursor.fetchone()[0]
+        
+        # درصد کاربران با حداقل یک تراکنش
+        transaction_percentage = round((users_with_transaction / stats['total_users']) * 100 if stats['total_users'] > 0 else 0, 1)
+        
+        # میانگین تعداد تراکنش به ازای هر کاربر
+        cursor.execute("SELECT COUNT(*) FROM transactions")
+        total_transactions = cursor.fetchone()[0]
+        avg_transactions_per_user = round(total_transactions / users_with_transaction if users_with_transaction > 0 else 0, 1)
+        
+        # میانگین موجودی کاربران
+        avg_balance = round(stats['total_balance'] / stats['total_users'] if stats['total_users'] > 0 else 0)
+        
+        conn.close()
+        
         msg = "👤 آمار رفتار کاربران\n\n"
-        msg += f"تعداد کل کاربران: {stats['total_users']}\n\n"
-        msg += "کاربران وفادار (فعال در حداقل ۲ هفته):\n"
-        for idx, (uid, weeks) in enumerate(loyal_users, 1):
-            uname = usernames.get(uid) or "بدون نام کاربری"
-            msg += f"{idx}. {uname} ({uid}) - {weeks} هفته فعال\n"
+        
+        # آمار کلی رفتار کاربران
+        msg += "📊 رفتار عمومی کاربران:\n"
+        msg += f"• کاربران با شماره تلفن: {users_with_phone} کاربر ({phone_percentage}%)\n"
+        msg += f"• کاربران با حداقل یک تراکنش: {users_with_transaction} کاربر ({transaction_percentage}%)\n"
+        msg += f"• میانگین تعداد تراکنش هر کاربر: {avg_transactions_per_user} تراکنش\n"
+        msg += f"• میانگین موجودی کاربران: {format_number_with_commas(avg_balance)} تومان\n\n"
+        
+        # آمار کاربران وفادار
+        msg += "🔄 کاربران وفادار (فعال در حداقل ۲ هفته):\n"
+        msg += f"• تعداد کاربران وفادار: {len(loyal_users)} کاربر\n"
+        if loyal_users:
+            # نمایش 5 کاربر وفادار برتر
+            user_ids = [uid for uid, _ in loyal_users[:5]]
+            usernames = get_usernames(user_ids)
+            msg += "• کاربران وفادار برتر:\n"
+            for i, (uid, weeks) in enumerate(loyal_users[:5], 1):
+                uname = usernames.get(uid, "بدون نام کاربری")
+                msg += f"  {i}. {uname} ({uid}) - فعال در {weeks} هفته\n"
+        
         await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup([
@@ -739,12 +878,13 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"به نام: {BOT_CONFIG['card_holder']}\n\n"
             "لطفاً شماره کارت جدید و نام صاحب کارت را به صورت زیر وارد کنید:\n"
             "6037991521965867, محمد امین چهاردولی",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
-            ])
-        )
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                ])
+            )
 
     elif callback_data.startswith("growth_chart^") and user_id == BOT_CONFIG["admin-username"]:
+        import matplotlib  # اضافه کردن ایمپورت برای رفع خطا
         matplotlib.rcParams['font.sans-serif'] = ['Tahoma', 'Vazirmatn', 'IRANSans', 'Arial']
         days = int(callback_data.split("^")[1])
         growth = get_growth_chart(days)
@@ -810,12 +950,12 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_photo(photo=buf, caption=f'نمودار رشد کاربران {days} روز اخیر')
         buf.close()
         plt.close()
-        await query.edit_message_text(
+            await query.edit_message_text(
             f"نمودار رشد کاربران {days} روز اخیر ارسال شد.",
-            reply_markup=InlineKeyboardMarkup([
+                reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("» بازگشت به آمار زمانی", callback_data="admin_stats_time^")]
-            ])
-        )
+                ])
+            )
         return
 
 # تابع برای پردازش دستور /admin
