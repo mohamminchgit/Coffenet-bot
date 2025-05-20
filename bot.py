@@ -16,6 +16,10 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import jdatetime
 from matplotlib import font_manager
+import PyPDF2
+import fitz  # PyMuPDF
+import docx
+import pptx
 
 # ماژول‌های داخلی
 from config import BOT_CONFIG, DB_CONFIG
@@ -26,7 +30,11 @@ from database import (setup_database, check_user_exists, register_user, get_user
                      get_top_inviter_by_count, get_total_referral_rewards,
                      get_growth_chart, get_all_users, register_transaction,
                      update_transaction_status, get_transaction_by_message_id, 
-                     get_user_transactions, get_loyal_users)
+                     get_user_transactions, get_loyal_users,
+                     get_print_prices, update_print_prices, save_user_address,
+                     get_user_addresses, register_print_order, update_print_order_status,
+                     get_user_print_orders, get_print_order_details, get_all_print_orders,
+                     check_user_info_exists)
 
 # تنظیم لاگینگ
 logging.basicConfig(
@@ -41,8 +49,16 @@ DB_PATH = DB_CONFIG["db_path"]
 # مراحل گفتگو برای افزایش موجودی
 PAYMENT_METHOD, ENTER_AMOUNT, CONFIRM_AMOUNT, SEND_RECEIPT = range(4)
 
+# مراحل گفتگو برای درخواست پرینت
+(UPLOAD_FILE, EXTRACT_PAGES, SELECT_PAGE_RANGE, SELECT_PRINT_TYPE, 
+ SELECT_PRINT_METHOD, SELECT_PAPER_SIZE, SELECT_PAPER_TYPE, 
+ SELECT_STAPLE, ENTER_DESCRIPTION, SELECT_DELIVERY_TYPE, 
+ ENTER_FULLNAME, ENTER_PHONE, SELECT_ADDRESS, ENTER_NEW_ADDRESS, 
+ CONFIRM_ORDER, PROCESS_PAYMENT) = range(16)
+
 # ذخیره اطلاعات موقت کاربر
 user_payment_data = {}
+user_print_data = {}
 
 # تابع برای جدا کردن اعداد سه رقم سه رقم
 def format_number_with_commas(number):
@@ -381,7 +397,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"📌 لطفاً یکی از خدمات {BOT_CONFIG['bot-name']} را انتخاب کنید :",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("درخواست پرینت یا کپی", url=f"https://pelicanstudio.ir/coffenetmehdi?user_id={user_id}")],
+                [InlineKeyboardButton("درخواست پرینت یا کپی", callback_data="print_request^")],
                 [InlineKeyboardButton("» بازگشت", callback_data="userpanel^")]
             ])
         )
@@ -656,11 +672,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uname = usernames.get(uid, "بدون نام کاربری")
             buttons.append([InlineKeyboardButton(f"جزئیات دعوت‌های {uname}", callback_data=f"referral_details^{uid}")])
         buttons.append([InlineKeyboardButton("» بازگشت به آمار", callback_data="admin_stats^")])
-            await query.edit_message_text(
+        await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
-        return
 
     elif callback_data.startswith("referral_details^") and user_id == BOT_CONFIG["admin-username"]:
         inviter_id = int(callback_data.split("^")[1])
@@ -674,7 +689,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             created = datetime.fromtimestamp(ref['created_at']).strftime('%Y/%m/%d') if ref['created_at'] else '-'
             ref_date = ref['referral_date'][:10] if ref['referral_date'] else '-'
             msg += f"{idx}. {uname} ({ref['invitee_user_id']}) | ثبت‌نام: {created} | دعوت: {ref_date}\n"
-            await query.edit_message_text(
+        await query.edit_message_text(
             msg,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_stats_referral^")]])
         )
@@ -950,13 +965,299 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_photo(photo=buf, caption=f'نمودار رشد کاربران {days} روز اخیر')
         buf.close()
         plt.close()
-            await query.edit_message_text(
+        await query.edit_message_text(
             f"نمودار رشد کاربران {days} روز اخیر ارسال شد.",
-                reply_markup=InlineKeyboardMarkup([
+            reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("» بازگشت به آمار زمانی", callback_data="admin_stats_time^")]
+            ])
+        )
+        return
+
+    elif callback_data == "print_request^":
+        # شروع فرآیند درخواست پرینت
+        await query.edit_message_text(
+            "📄 درخواست پرینت یا کپی\n\n"
+            "لطفاً فایل مورد نظر خود را برای پرینت ارسال کنید.\n"
+            "فرمت‌های قابل قبول: PDF, Word (docx), PowerPoint (pptx), تصاویر (jpg, png)",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ])
+        )
+        
+        # تنظیم وضعیت گفتگو
+        context.user_data["print_state"] = UPLOAD_FILE
+        
+        # پاک کردن داده‌های قبلی اگر وجود داشته باشد
+        if user_id in user_print_data:
+            del user_print_data[user_id]
+        
+        # ایجاد دیکشنری جدید برای ذخیره اطلاعات سفارش
+        user_print_data[user_id] = {
+            "file_ids": [],
+            "file_paths": [],
+            "file_type": None,
+            "page_count": 0,
+            "images_count": 0
+        }
+
+    # --- فرآیند پرینت ---
+    elif callback_data.startswith('page_range^'):
+        if callback_data == 'page_range^all':
+            user_print_data[user_id]['page_range'] = 'all'
+            await query.edit_message_text(
+                "لطفاً نوع چاپ را انتخاب کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("سیاه و سفید", callback_data="print_type^bw")],
+                    [InlineKeyboardButton("رنگی", callback_data="print_type^color")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
                 ])
             )
-        return
+            context.user_data["print_state"] = SELECT_PRINT_TYPE
+        elif callback_data == 'page_range^custom':
+            await query.edit_message_text(
+                "لطفاً محدوده صفحات مورد نظر را به صورت مثال زیر وارد کنید:\nمثال: 1-5,7,9-12",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = SELECT_PAGE_RANGE
+
+    elif callback_data.startswith('print_type^'):
+        print_type = callback_data.split('^')[1]
+        user_print_data[user_id]['print_type'] = print_type
+        await query.edit_message_text(
+            "لطفاً روش چاپ را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("یک رو", callback_data="print_method^single")],
+                [InlineKeyboardButton("دو رو", callback_data="print_method^double")],
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ])
+        )
+        context.user_data["print_state"] = SELECT_PRINT_METHOD
+
+    elif callback_data.startswith('print_method^'):
+        print_method = callback_data.split('^')[1]
+        user_print_data[user_id]['print_method'] = print_method
+        # منوی انتخاب اندازه کاغذ
+        await query.edit_message_text(
+            "لطفاً اندازه کاغذ را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("A4", callback_data="paper_size^a4"), InlineKeyboardButton("A5", callback_data="paper_size^a5"), InlineKeyboardButton("A3", callback_data="paper_size^a3")],
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ])
+        )
+        context.user_data["print_state"] = SELECT_PAPER_SIZE
+
+    elif callback_data.startswith('paper_size^'):
+        paper_size = callback_data.split('^')[1]
+        user_print_data[user_id]['paper_size'] = paper_size
+        # منوی انتخاب نوع کاغذ با توجه به محدودیت‌ها
+        paper_type_buttons = [[InlineKeyboardButton("معمولی", callback_data="paper_type^normal")]]
+        if paper_size != 'a5':
+            paper_type_buttons.append([InlineKeyboardButton("گلاسه 175 گرمی", callback_data="paper_type^glossy_175")])
+            paper_type_buttons.append([InlineKeyboardButton("گلاسه 250 گرمی", callback_data="paper_type^glossy_250")])
+        paper_type_buttons.append([InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")])
+        await query.edit_message_text(
+            "لطفاً نوع کاغذ را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup(paper_type_buttons)
+        )
+        context.user_data["print_state"] = SELECT_PAPER_TYPE
+
+    elif callback_data.startswith('paper_type^'):
+        paper_type = callback_data.split('^')[1]
+        user_print_data[user_id]['paper_type'] = paper_type
+        await query.edit_message_text(
+            "آیا نیاز به منگنه دارد؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("بله", callback_data="staple^yes"), InlineKeyboardButton("خیر", callback_data="staple^no")],
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ])
+        )
+        context.user_data["print_state"] = SELECT_STAPLE
+
+    elif callback_data.startswith('staple^'):
+        staple = callback_data.split('^')[1] == 'yes'
+        user_print_data[user_id]['staple'] = staple
+        await query.edit_message_text(
+            "لطفاً توضیحات سفارش (اختیاری) را وارد کنید یا فقط یک پیام خالی ارسال کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ])
+        )
+        context.user_data["print_state"] = ENTER_DESCRIPTION
+
+    elif callback_data.startswith('delivery_type^'):
+        delivery_type = callback_data.split('^')[1]
+        user_print_data[user_id]['delivery_type'] = delivery_type
+        if delivery_type == 'in_person':
+            user_info = check_user_info_exists(user_id)
+            if user_info:
+                user_print_data[user_id]["full_name"] = user_info["full_name"]
+                user_print_data[user_id]["phone_number"] = user_info["phone_number"]
+                await query.edit_message_text(
+                    f"اطلاعات قبلی شما:\n\n👤 نام و نام خانوادگی: {user_info['full_name']}\n📱 شماره تماس: {user_info['phone_number']}\n\nآیا می‌خواهید از همین اطلاعات استفاده کنید؟",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ بله، همین اطلاعات", callback_data="use_previous_info^yes")],
+                        [InlineKeyboardButton("❌ خیر، اطلاعات جدید", callback_data="use_previous_info^no")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+            else:
+                await query.edit_message_text(
+                    "لطفاً نام و نام خانوادگی خود را وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+                context.user_data["print_state"] = ENTER_FULLNAME
+        else:
+            await query.edit_message_text(
+                "لطفاً شماره تماس خود را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = ENTER_PHONE
+
+    elif callback_data.startswith('select_address^'):
+        address_id = callback_data.split('^')[1]
+        if address_id == 'new':
+            await query.edit_message_text(
+                "لطفاً آدرس جدید خود را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = ENTER_NEW_ADDRESS
+        else:
+            addresses = get_user_addresses(user_id)
+            address = next((a['address'] for a in addresses if str(a['id']) == address_id), None)
+            user_print_data[user_id]['address'] = address
+            await show_order_confirmation(update, context, user_id)
+            context.user_data["print_state"] = CONFIRM_ORDER
+
+    elif callback_data.startswith('more_images^'):
+        more = callback_data.split('^')[1]
+        if more == 'yes':
+            await query.edit_message_text(
+                "لطفاً تصویر بعدی را ارسال کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = UPLOAD_FILE
+        else:
+            await query.edit_message_text(
+                "لطفاً نوع چاپ را انتخاب کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("سیاه و سفید", callback_data="print_type^bw")],
+                    [InlineKeyboardButton("رنگی", callback_data="print_type^color")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = SELECT_PRINT_TYPE
+
+    elif callback_data.startswith('use_previous_info^'):
+        use_prev = callback_data.split('^')[1]
+        if use_prev == 'yes':
+            await show_order_confirmation(update, context, user_id)
+            context.user_data["print_state"] = CONFIRM_ORDER
+        else:
+            await query.edit_message_text(
+                "لطفاً نام و نام خانوادگی خود را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            context.user_data["print_state"] = ENTER_FULLNAME
+
+    elif callback_data.startswith('confirm_order^'):
+        confirm_type = callback_data.split('^')[1]
+        print_data = user_print_data.get(user_id, {})
+        total_price = print_data.get('total_price', 0)
+        user_profile = get_user_profile(user_id)
+        user_balance = user_profile.get('balance', 0)
+        if confirm_type == 'balance' and user_balance >= total_price:
+            update_user_balance(user_id, -total_price)
+            order_id = register_print_order(
+                user_id,
+                ','.join(print_data.get('file_ids', [])),
+                print_data.get('file_type'),
+                print_data.get('page_count', 0),
+                print_data.get('page_range', ''),
+                print_data.get('print_type', ''),
+                print_data.get('print_method', ''),
+                print_data.get('paper_size', ''),
+                print_data.get('paper_type', ''),
+                int(print_data.get('staple', False)),
+                print_data.get('delivery_type', ''),
+                print_data.get('full_name', ''),
+                print_data.get('phone_number', ''),
+                print_data.get('address', ''),
+                print_data.get('description', ''),
+                total_price
+            )
+            await query.edit_message_text("✅ سفارش شما با موفقیت ثبت شد و در حال پردازش است.")
+            
+            # ارسال به کانال ادمین
+            logger.info(f"ارسال سفارش به کانال ادمین با شناسه {order_id}")
+            caption = f"سفارش جدید پرینت\n\nشناسه سفارش: {order_id}\nنام: {print_data.get('full_name','')}\nشماره: {print_data.get('phone_number','')}\nنوع چاپ: {print_data.get('print_type','')}\nروش: {print_data.get('print_method','')}\nکاغذ: {print_data.get('paper_type','')}\nاندازه: {print_data.get('paper_size','')}\nتعداد صفحات/عکس: {print_data.get('page_count', print_data.get('images_count',0))}\nمنگنه: {'دارد' if print_data.get('staple') else 'ندارد'}\nتحویل: {print_data.get('delivery_type','')}\nآدرس: {print_data.get('address','')}\nتوضیحات: {print_data.get('description','')}\nمبلغ: {total_price} تومان"
+            
+            try:
+                # ارسال اطلاعات سفارش به کانال ادمین
+                admin_channel_id = BOT_CONFIG.get("order-channel-id")
+                if admin_channel_id:
+                    logger.info(f"ارسال اطلاعات سفارش به کانال ادمین: {admin_channel_id}")
+                    
+                    # ارسال فایل‌ها
+                    file_ids = print_data.get('file_ids', [])
+                    logger.info(f"تعداد فایل‌ها برای ارسال: {len(file_ids)}")
+                    
+                    for idx, file_id in enumerate(file_ids):
+                        try:
+                            file_caption = caption if idx == 0 else f"فایل {idx+1} از سفارش {order_id}"
+                            logger.info(f"ارسال فایل با شناسه {file_id} به کانال ادمین")
+                            
+                            if print_data.get('file_type') == 'image':
+                                await context.bot.send_photo(
+                                    chat_id=admin_channel_id,
+                                    photo=file_id,
+                                    caption=file_caption
+                                )
+                            else:
+                                await context.bot.send_document(
+                                    chat_id=admin_channel_id,
+                                    document=file_id,
+                                    caption=file_caption
+                                )
+                            logger.info(f"فایل با شناسه {file_id} با موفقیت به کانال ادمین ارسال شد")
+                        except Exception as e:
+                            logger.error(f"خطا در ارسال فایل {idx+1} به کانال ادمین: {str(e)}")
+                else:
+                    logger.error("شناسه کانال ادمین تنظیم نشده است")
+            except Exception as e:
+                logger.error(f"خطا در ارسال سفارش به کانال ادمین: {str(e)}")
+            
+            # پاکسازی داده‌های سفارش
+            user_print_data.pop(user_id, None)
+            context.user_data.pop("print_state", None)
+        elif confirm_type == 'increase':
+            await query.edit_message_text(
+                f"برای پرداخت مبلغ {total_price - user_balance} تومان، لطفاً افزایش موجودی دهید.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("افزایش موجودی", callback_data="increasebalance^")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+        elif confirm_type == 'partial' and user_balance > 0:
+            # هدایت به پرداخت کسری
+            await query.edit_message_text(
+                f"شما {user_balance} تومان اعتبار دارید. لطفاً {total_price - user_balance} تومان دیگر پرداخت کنید.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("افزایش موجودی", callback_data="increasebalance^")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
 
 # تابع برای پردازش دستور /admin
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -988,7 +1289,318 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # لاگ برای دیباگ
     logger.info(f"دریافت پیام از کاربر {user_id}")
     
-    # بررسی وضعیت گفتگو
+    # بررسی وضعیت گفتگو برای درخواست پرینت
+    if "print_state" in context.user_data:
+        print_state = context.user_data["print_state"]
+        logger.info(f"وضعیت درخواست پرینت کاربر {user_id}: {print_state}")
+        
+        if print_state == UPLOAD_FILE:
+            # دریافت فایل برای پرینت
+            if update.message.document:
+                # دریافت فایل سند
+                document = update.message.document
+                file_id = document.file_id
+                mime_type = document.mime_type
+                file_name = document.file_name or "unknown"
+                file_extension = os.path.splitext(file_name)[1].lower() if file_name else ""
+                
+                # بررسی نوع فایل
+                valid_extensions = ['.pdf', '.docx', '.pptx']
+                if file_extension not in valid_extensions:
+                    await update.message.reply_text(
+                        "❌ فرمت فایل پشتیبانی نمی‌شود. لطفاً یک فایل PDF، Word یا PowerPoint ارسال کنید.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    return
+                
+                # دانلود فایل
+                file_path = await download_telegram_file(context, file_id)
+                if not file_path:
+                    await update.message.reply_text(
+                        "❌ خطا در دانلود فایل. لطفاً مجدداً تلاش کنید.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    return
+                
+                # استخراج نوع فایل و تعداد صفحات
+                file_type, page_count = await get_file_pages(file_path)
+                
+                if page_count == 0:
+                    await update.message.reply_text(
+                        "❌ خطا در استخراج تعداد صفحات فایل. لطفاً فایل دیگری ارسال کنید.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    return
+                
+                # ذخیره اطلاعات فایل
+                user_print_data[user_id]["file_ids"].append(file_id)
+                user_print_data[user_id]["file_paths"].append(file_path)
+                user_print_data[user_id]["file_type"] = file_type
+                user_print_data[user_id]["page_count"] = page_count
+                
+                # نمایش اطلاعات فایل و درخواست محدوده صفحات
+                await update.message.reply_text(
+                    f"✅ فایل با موفقیت دریافت شد!\n\n"
+                    f"📄 نوع فایل: {file_type.upper()}\n"
+                    f"📊 تعداد صفحات: {page_count}\n\n"
+                    f"لطفاً محدوده صفحات مورد نظر برای پرینت را مشخص کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("همه صفحات", callback_data=f"page_range^all")],
+                        [InlineKeyboardButton("انتخاب محدوده", callback_data=f"page_range^custom")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+                
+                # تنظیم وضعیت گفتگو
+                context.user_data["print_state"] = SELECT_PAGE_RANGE
+                
+            elif update.message.photo:
+                # دریافت عکس
+                photo = update.message.photo[-1]  # بزرگترین نسخه عکس
+                file_id = photo.file_id
+                
+                # دانلود فایل
+                file_path = await download_telegram_file(context, file_id, f"{uuid.uuid4()}.jpg")
+                if not file_path:
+                    await update.message.reply_text(
+                        "❌ خطا در دانلود تصویر. لطفاً مجدداً تلاش کنید.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    return
+                
+                # ذخیره اطلاعات فایل
+                user_print_data[user_id]["file_ids"].append(file_id)
+                user_print_data[user_id]["file_paths"].append(file_path)
+                user_print_data[user_id]["file_type"] = "image"
+                user_print_data[user_id]["images_count"] += 1
+                
+                # پرسیدن آیا عکس دیگری هست
+                await update.message.reply_text(
+                    f"✅ تصویر با موفقیت دریافت شد! (تعداد: {user_print_data[user_id]['images_count']})\n\n"
+                    f"آیا تصویر دیگری برای پرینت دارید؟",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ بله، عکس دیگری دارم", callback_data="more_images^yes")],
+                        [InlineKeyboardButton("❌ خیر، ادامه بده", callback_data="more_images^no")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+                
+            else:
+                # اگر نوع فایل پشتیبانی نشده باشد
+                await update.message.reply_text(
+                    "❌ لطفاً یک فایل (PDF، Word، PowerPoint) یا تصویر ارسال کنید.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+            
+            return
+        
+        elif print_state == SELECT_PAGE_RANGE and update.message.text:
+            # دریافت محدوده صفحات سفارشی
+            try:
+                page_range = update.message.text.strip()
+                
+                # اعتبارسنجی فرمت محدوده صفحات
+                if not re.match(r'^(\d+(-\d+)?)(,\s*\d+(-\d+)?)*$', page_range):
+                    raise ValueError("فرمت نامعتبر")
+                
+                # ذخیره محدوده صفحات
+                user_print_data[user_id]["page_range"] = page_range
+                
+                # ادامه به مرحله بعدی (انتخاب نوع چاپ)
+                await update.message.reply_text(
+                    "لطفاً نوع چاپ را انتخاب کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("سیاه و سفید", callback_data="print_type^bw")],
+                        [InlineKeyboardButton("رنگی", callback_data="print_type^color")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+                
+                # تنظیم وضعیت گفتگو
+                context.user_data["print_state"] = SELECT_PRINT_TYPE
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ فرمت محدوده صفحات نامعتبر است. لطفاً به صورت اعداد جدا شده با کاما یا محدوده (مثال: 1-5,7,9-12) وارد کنید.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+            
+            return
+        
+        elif print_state == ENTER_DESCRIPTION:
+            # دریافت توضیحات سفارش
+            description = update.message.text
+            user_print_data[user_id]["description"] = description
+            
+            # بررسی آیا ارسال با پیک فعال است
+            prices = get_print_prices()
+            delivery_enabled = prices.get('delivery_enabled', False) if prices else False
+            
+            if delivery_enabled:
+                # نمایش گزینه‌های نوع تحویل
+                await update.message.reply_text(
+                    "لطفاً نوع تحویل سفارش را انتخاب کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("تحویل حضوری", callback_data="delivery_type^in_person")],
+                        [InlineKeyboardButton("ارسال با پیک", callback_data="delivery_type^delivery")],
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+            else:
+                # اگر ارسال با پیک غیرفعال باشد، مستقیماً به حالت تحویل حضوری برو
+                user_print_data[user_id]["delivery_type"] = "in_person"
+                
+                # بررسی وجود اطلاعات کاربر
+                user_info = check_user_info_exists(user_id)
+                
+                if user_info:
+                    # اگر اطلاعات کاربر موجود باشد، آنها را نمایش بده و بپرس آیا همان اطلاعات استفاده شود
+                    user_print_data[user_id]["full_name"] = user_info["full_name"]
+                    user_print_data[user_id]["phone_number"] = user_info["phone_number"]
+                    
+                    await update.message.reply_text(
+                        f"اطلاعات قبلی شما:\n\n"
+                        f"👤 نام و نام خانوادگی: {user_info['full_name']}\n"
+                        f"📱 شماره تماس: {user_info['phone_number']}\n\n"
+                        f"آیا می‌خواهید از همین اطلاعات استفاده کنید؟",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ بله، همین اطلاعات", callback_data="use_previous_info^yes")],
+                            [InlineKeyboardButton("❌ خیر، اطلاعات جدید", callback_data="use_previous_info^no")],
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                else:
+                    # اگر اطلاعات کاربر موجود نباشد، درخواست نام و نام خانوادگی
+                    await update.message.reply_text(
+                        "لطفاً نام و نام خانوادگی خود را وارد کنید:",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    
+                    # تنظیم وضعیت گفتگو
+                    context.user_data["print_state"] = ENTER_FULLNAME
+            
+            # تنظیم وضعیت گفتگو
+            if delivery_enabled:
+                context.user_data["print_state"] = SELECT_DELIVERY_TYPE
+            
+            return
+        
+        elif print_state == ENTER_FULLNAME:
+            # دریافت نام و نام خانوادگی
+            full_name = update.message.text
+            user_print_data[user_id]["full_name"] = full_name
+            
+            # درخواست شماره تماس
+            await update.message.reply_text(
+                "لطفاً شماره تماس خود را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                ])
+            )
+            
+            # تنظیم وضعیت گفتگو
+            context.user_data["print_state"] = ENTER_PHONE
+            
+            return
+        
+        elif print_state == ENTER_PHONE:
+            # دریافت شماره تماس
+            phone_number = update.message.text
+            
+            # اعتبارسنجی شماره تماس
+            if not re.match(r'^(0|\+98)?9\d{9}$', phone_number):
+                await update.message.reply_text(
+                    "❌ شماره تماس وارد شده نامعتبر است. لطفاً یک شماره موبایل معتبر وارد کنید.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                    ])
+                )
+                return
+            
+            # ذخیره شماره تماس
+            user_print_data[user_id]["phone_number"] = phone_number
+            
+            # اگر نوع تحویل پیک باشد، درخواست آدرس
+            if user_print_data[user_id].get("delivery_type") == "delivery":
+                # بررسی وجود آدرس‌های قبلی
+                addresses = get_user_addresses(user_id)
+                
+                if addresses:
+                    # نمایش آدرس‌های قبلی
+                    keyboard = []
+                    for i, address in enumerate(addresses, 1):
+                        keyboard.append([InlineKeyboardButton(f"آدرس {i}", callback_data=f"select_address^{address['id']}")])
+                    
+                    keyboard.append([InlineKeyboardButton("➕ آدرس جدید", callback_data="select_address^new")])
+                    keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")])
+                    
+                    # ساخت متن آدرس‌ها
+                    address_text = "آدرس‌های قبلی شما:\n\n"
+                    for i, address in enumerate(addresses, 1):
+                        address_text += f"{i}- {address['address']}\n\n"
+                    
+                    address_text += "لطفاً یکی از آدرس‌های بالا را انتخاب کنید یا آدرس جدید وارد کنید:"
+                    
+                    await update.message.reply_text(
+                        address_text,
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                    
+                    # تنظیم وضعیت گفتگو
+                    context.user_data["print_state"] = SELECT_ADDRESS
+                else:
+                    # درخواست آدرس جدید
+                    await update.message.reply_text(
+                        "لطفاً آدرس دقیق خود را برای ارسال با پیک وارد کنید:",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+                        ])
+                    )
+                    
+                    # تنظیم وضعیت گفتگو
+                    context.user_data["print_state"] = ENTER_NEW_ADDRESS
+            else:
+                # اگر نوع تحویل حضوری باشد، به مرحله تأیید نهایی برو
+                await show_order_confirmation(update, context, user_id)
+                
+                # تنظیم وضعیت گفتگو
+                context.user_data["print_state"] = CONFIRM_ORDER
+            
+            return
+        
+        elif print_state == ENTER_NEW_ADDRESS:
+            # دریافت آدرس جدید
+            address = update.message.text
+            
+            # ذخیره آدرس در دیتابیس
+            address_id = save_user_address(user_id, address)
+            
+            # ذخیره آدرس در اطلاعات سفارش
+            user_print_data[user_id]["address"] = address
+            
+            # نمایش تأیید نهایی سفارش
+            await show_order_confirmation(update, context, user_id)
+            
+            # تنظیم وضعیت گفتگو
+            context.user_data["print_state"] = CONFIRM_ORDER
+            
+            return
+    
+    # بررسی وضعیت گفتگو برای افزایش موجودی
     if "payment_state" in context.user_data:
         payment_state = context.user_data["payment_state"]
         logger.info(f"وضعیت پرداخت کاربر {user_id}: {payment_state}")
@@ -1320,7 +1932,253 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # پاسخ به پیام‌های نامشخص
             await update.message.reply_text("متوجه نشدم چی گفتی! لطفاً دوباره تلاش کنید. 🤔")
 
-# تابع اصلی
+# تابع برای دانلود فایل از تلگرام
+async def download_telegram_file(context, file_id, custom_filename=None):
+    try:
+        logger.info(f"شروع دانلود فایل با شناسه {file_id}")
+        file = await context.bot.get_file(file_id)
+        file_path = file.file_path
+        logger.info(f"مسیر فایل در تلگرام: {file_path}")
+        
+        # ایجاد نام فایل منحصر به فرد
+        if custom_filename:
+            filename = custom_filename
+        else:
+            original_filename = os.path.basename(file_path)
+            filename = f"{uuid.uuid4()}_{original_filename}"
+        
+        # ایجاد دایرکتوری برای ذخیره فایل‌ها
+        os.makedirs('uploads', exist_ok=True)
+        local_file_path = os.path.join('uploads', filename)
+        logger.info(f"ذخیره فایل در مسیر محلی: {local_file_path}")
+        
+        # دانلود فایل
+        await file.download_to_drive(local_file_path)
+        logger.info(f"فایل با موفقیت دانلود شد: {local_file_path}")
+        
+        return local_file_path
+    except Exception as e:
+        logger.error(f"خطا در دانلود فایل: {e}")
+        return None
+
+# تابع برای استخراج تعداد صفحات از فایل PDF
+async def extract_pdf_pages(file_path):
+    try:
+        logger.info(f"استخراج تعداد صفحات PDF از فایل: {file_path}")
+        with open(file_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            pages = len(pdf_reader.pages)
+            logger.info(f"تعداد صفحات PDF: {pages}")
+            return pages
+    except Exception as e:
+        logger.error(f"خطا در استخراج تعداد صفحات PDF: {e}")
+        return 0
+
+# تابع برای استخراج تعداد صفحات از فایل Word
+async def extract_docx_pages(file_path):
+    try:
+        logger.info(f"استخراج تعداد صفحات Word از فایل: {file_path}")
+        doc = docx.Document(file_path)
+        pages = len(doc.paragraphs) // 20 + 1  # تخمین تقریبی تعداد صفحات
+        logger.info(f"تعداد صفحات Word: {pages}")
+        return pages
+    except Exception as e:
+        logger.error(f"خطا در استخراج تعداد صفحات Word: {e}")
+        return 0
+
+# تابع برای استخراج تعداد صفحات از فایل PowerPoint
+async def extract_pptx_pages(file_path):
+    try:
+        logger.info(f"استخراج تعداد صفحات PowerPoint از فایل: {file_path}")
+        presentation = pptx.Presentation(file_path)
+        slides = len(presentation.slides)
+        logger.info(f"تعداد صفحات PowerPoint: {slides}")
+        return slides
+    except Exception as e:
+        logger.error(f"خطا در استخراج تعداد صفحات PowerPoint: {e}")
+        return 0
+
+# تابع برای تشخیص نوع فایل و استخراج تعداد صفحات
+async def get_file_pages(file_path):
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if file_extension == '.pdf':
+        return 'pdf', await extract_pdf_pages(file_path)
+    elif file_extension == '.docx':
+        return 'docx', await extract_docx_pages(file_path)
+    elif file_extension == '.pptx':
+        return 'pptx', await extract_pptx_pages(file_path)
+    elif file_extension in ['.jpg', '.jpeg', '.png']:
+        return 'image', 1
+    else:
+        return 'unknown', 0
+
+# تابع برای محاسبه قیمت پرینت
+async def calculate_print_price(print_data):
+    try:
+        # دریافت قیمت‌های پایه
+        prices = get_print_prices()
+        if not prices:
+            return 0
+        
+        # استخراج اطلاعات سفارش
+        page_count = print_data.get('page_count', 0)
+        print_type = print_data.get('print_type', 'bw')  # سیاه و سفید یا رنگی
+        print_method = print_data.get('print_method', 'single')  # یک رو یا دو رو
+        paper_size = print_data.get('paper_size', 'a4')  # A4, A5, A3
+        paper_type = print_data.get('paper_type', 'normal')  # معمولی یا گلاسه
+        staple = print_data.get('staple', False)  # منگنه
+        delivery_type = print_data.get('delivery_type', 'in_person')  # حضوری یا پیک
+        
+        # پیدا کردن قیمت مناسب بر اساس بازه صفحات
+        price_per_page = 0
+        for price_range in prices.get('price_ranges', []):
+            if (price_range['print_type'] == print_type and 
+                price_range['print_method'] == print_method and 
+                price_range['paper_size'] == paper_size and 
+                price_range['paper_type'] == paper_type and 
+                price_range['range_start'] <= page_count <= price_range['range_end']):
+                price_per_page = price_range['price_per_page']
+                break
+        
+        # محاسبه قیمت کل بر اساس تعداد صفحات
+        total_price = price_per_page * page_count
+        
+        # اضافه کردن هزینه منگنه در صورت نیاز
+        if staple:
+            total_price += prices.get('staple_price', 0)
+        
+        # اضافه کردن هزینه پیک در صورت نیاز
+        if delivery_type == 'delivery' and prices.get('delivery_enabled', False):
+            total_price += prices.get('delivery_price', 0)
+        
+        return total_price
+    except Exception as e:
+        logger.error(f"خطا در محاسبه قیمت پرینت: {e}")
+        return 0
+
+# تابع برای نمایش تأیید نهایی سفارش
+async def show_order_confirmation(update, context, user_id):
+    try:
+        # دریافت اطلاعات سفارش
+        print_data = user_print_data.get(user_id, {})
+        if not print_data:
+            raise ValueError("اطلاعات سفارش یافت نشد")
+        
+        # محاسبه قیمت کل
+        total_price = await calculate_print_price(print_data)
+        print_data["total_price"] = total_price
+        
+        # ساخت متن تأیید سفارش
+        confirmation_text = "📋 خلاصه سفارش شما:\n\n"
+        
+        # اطلاعات فایل
+        if print_data.get("file_type") == "image":
+            confirmation_text += f"📷 نوع فایل: تصویر\n"
+            confirmation_text += f"📊 تعداد تصاویر: {print_data.get('images_count', 0)}\n"
+        else:
+            confirmation_text += f"📄 نوع فایل: {print_data.get('file_type', '').upper()}\n"
+            confirmation_text += f"📊 تعداد صفحات: {print_data.get('page_count', 0)}\n"
+            if print_data.get("page_range") and print_data.get("page_range") != "all":
+                confirmation_text += f"🔢 محدوده صفحات: {print_data.get('page_range')}\n"
+        
+        # اطلاعات چاپ
+        print_type_text = "رنگی" if print_data.get("print_type") == "color" else "سیاه و سفید"
+        confirmation_text += f"🖨️ نوع چاپ: {print_type_text}\n"
+        
+        print_method_text = "دو رو" if print_data.get("print_method") == "double" else "یک رو"
+        confirmation_text += f"📑 روش چاپ: {print_method_text}\n"
+        
+        paper_size_text = print_data.get("paper_size", "a4").upper()
+        confirmation_text += f"📏 اندازه کاغذ: {paper_size_text}\n"
+        
+        paper_type_map = {
+            "normal": "معمولی",
+            "glossy_175": "گلاسه 175 گرمی",
+            "glossy_250": "گلاسه 250 گرمی"
+        }
+        paper_type_text = paper_type_map.get(print_data.get("paper_type", "normal"), "معمولی")
+        confirmation_text += f"📃 نوع کاغذ: {paper_type_text}\n"
+        
+        if print_data.get("staple"):
+            confirmation_text += "📎 منگنه: بله\n"
+        
+        # اطلاعات تحویل
+        delivery_type_text = "ارسال با پیک" if print_data.get("delivery_type") == "delivery" else "تحویل حضوری"
+        confirmation_text += f"🚚 نوع تحویل: {delivery_type_text}\n"
+        
+        if print_data.get("delivery_type") == "delivery" and print_data.get("address"):
+            confirmation_text += f"📍 آدرس: {print_data.get('address')}\n"
+        
+        # اطلاعات تماس
+        confirmation_text += f"👤 نام و نام خانوادگی: {print_data.get('full_name', '')}\n"
+        confirmation_text += f"📱 شماره تماس: {print_data.get('phone_number', '')}\n"
+        
+        # توضیحات
+        if print_data.get("description"):
+            confirmation_text += f"\n📝 توضیحات: {print_data.get('description')}\n"
+        
+        # قیمت کل
+        formatted_price = format_number_with_commas(total_price)
+        confirmation_text += f"\n💰 قیمت کل: {formatted_price} تومان"
+        
+        # دریافت موجودی کاربر
+        user_profile = get_user_profile(user_id)
+        user_balance = user_profile.get("balance", 0)
+        formatted_balance = format_number_with_commas(user_balance)
+        
+        # اضافه کردن اطلاعات موجودی
+        confirmation_text += f"\n💳 موجودی شما: {formatted_balance} تومان"
+        
+        # بررسی کافی بودن موجودی
+        if user_balance >= total_price:
+            confirmation_text += "\n\n✅ موجودی شما برای این سفارش کافی است."
+            
+            # دکمه‌های تأیید و لغو
+            keyboard = [
+                [InlineKeyboardButton("✅ تأیید و پرداخت", callback_data="confirm_order^balance")],
+                [InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]
+            ]
+        else:
+            # محاسبه مبلغ کسری
+            shortage = total_price - user_balance
+            formatted_shortage = format_number_with_commas(shortage)
+            
+            confirmation_text += f"\n\n❌ موجودی شما برای این سفارش کافی نیست. شما به {formatted_shortage} تومان دیگر نیاز دارید."
+            
+            # دکمه‌های افزایش موجودی یا پرداخت با موجودی فعلی
+            keyboard = []
+            
+            if user_balance > 0:
+                keyboard.append([InlineKeyboardButton("💰 پرداخت با موجودی فعلی + واریز مابقی", callback_data="confirm_order^partial")])
+            
+            keyboard.append([InlineKeyboardButton("💳 افزایش موجودی", callback_data="confirm_order^increase")])
+            keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")])
+        
+        # ارسال پیام تأیید
+        if isinstance(update, Update):
+            if update.message:
+                await update.message.reply_text(confirmation_text, reply_markup=InlineKeyboardMarkup(keyboard))
+            elif update.callback_query:
+                await update.callback_query.edit_message_text(confirmation_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            # اگر update یک شیء Update نباشد، از context برای ارسال پیام استفاده می‌کنیم
+            await context.bot.send_message(chat_id=user_id, text=confirmation_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    except Exception as e:
+        logger.error(f"خطا در نمایش تأیید سفارش: {e}")
+        
+        # ارسال پیام خطا
+        error_message = "❌ خطایی در پردازش سفارش رخ داد. لطفاً مجدداً تلاش کنید."
+        
+        if isinstance(update, Update):
+            if update.message:
+                await update.message.reply_text(error_message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]]))
+            elif update.callback_query:
+                await update.callback_query.edit_message_text(error_message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]]))
+        else:
+            await context.bot.send_message(chat_id=user_id, text=error_message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")]]))
+
 def main():
     # ایجاد پایگاه داده
     setup_database()
@@ -1340,6 +2198,7 @@ def main():
     application.add_handler(CallbackQueryHandler(button_click))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_message))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_message))  # اضافه کردن هندلر برای فایل‌های document
     
     # شروع پولینگ
     logger.info(f"ربات {BOT_CONFIG['bot-name']} شروع به کار کرد...")
