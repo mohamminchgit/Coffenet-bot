@@ -15,7 +15,9 @@ BOT_CONFIG = {
     "bot-username": os.getenv("BOT_USERNAME", "test1389chbot"),
     "referal-creadit": os.getenv("REFERAL_CREDIT", "3000"),
     "bot-creator": os.getenv("BOT_CREATOR", "mohamminch"),
-    "order-channel-id": os.getenv("ORDER_CHANNEL_ID", "-1002478908922")
+    "order-channel-id": os.getenv("ORDER_CHANNEL_ID", "-1002478908922"),
+    "card_number": os.getenv("CARD_NUMBER", "6037991521965867"),
+    "card_holder": os.getenv("CARD_HOLDER", "محمد امین چهاردولی")
 }
 
 # تنظیمات پایگاه داده

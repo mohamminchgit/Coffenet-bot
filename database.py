@@ -3,6 +3,7 @@ import logging
 import os
 from datetime import datetime
 from config import DB_CONFIG
+import time
 
 # تنظیم لاگینگ
 logging.basicConfig(
@@ -61,6 +62,15 @@ def setup_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        ''')
+        
+        # ایجاد جدول اطلاعات کارت اگر وجود نداشته باشد
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS card_info (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            card_number TEXT,
+            card_holder TEXT
         )
         ''')
         
@@ -328,4 +338,74 @@ def get_user_transactions(user_id, limit=10):
         return result
     except Exception as e:
         logger.error(f"خطا در دریافت تاریخچه تراکنش‌های کاربر: {e}")
-        return [] 
+        return []
+
+def get_card_info():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT card_number, card_holder FROM card_info WHERE id = 1")
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {"card_number": row[0], "card_holder": row[1]}
+        return None
+    except Exception as e:
+        logger.error(f"خطا در دریافت اطلاعات کارت: {e}")
+        return None
+
+def set_card_info(card_number, card_holder):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO card_info (id, card_number, card_holder) VALUES (1, ?, ?)", (card_number, card_holder))
+        conn.commit()
+        conn.close()
+        logger.info("اطلاعات کارت با موفقیت ذخیره شد")
+        return True
+    except Exception as e:
+        logger.error(f"خطا در ذخیره اطلاعات کارت: {e}")
+        return False
+
+def get_stats():
+    now = int(time.time())
+    today_start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    yesterday_start = today_start - 86400
+    week_start = today_start - 7*86400
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # کل کاربران
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        # کاربران امروز
+        cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (today_start,))
+        today_users = cursor.fetchone()[0]
+        # کاربران دیروز
+        cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?", (yesterday_start, today_start))
+        yesterday_users = cursor.fetchone()[0]
+        # کاربران هفته گذشته
+        cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (week_start,))
+        week_users = cursor.fetchone()[0]
+        # کاربران دعوت شده (referrals)
+        cursor.execute("SELECT COUNT(*) FROM referrals")
+        total_referrals = cursor.fetchone()[0]
+        # کاربران فعال امروز (کسانی که تراکنش یا پیام داشته‌اند)
+        cursor.execute("SELECT COUNT(DISTINCT user_id) FROM transactions WHERE created_at >= ?", (today_start,))
+        active_today = cursor.fetchone()[0]
+        # مجموع موجودی کاربران
+        cursor.execute("SELECT SUM(balance) FROM users")
+        total_balance = cursor.fetchone()[0] or 0
+        conn.close()
+        return {
+            "total_users": total_users,
+            "today_users": today_users,
+            "yesterday_users": yesterday_users,
+            "week_users": week_users,
+            "total_referrals": total_referrals,
+            "active_today": active_today,
+            "total_balance": total_balance
+        }
+    except Exception as e:
+        logger.error(f"خطا در دریافت آمار: {e}")
+        return None 

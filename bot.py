@@ -11,7 +11,8 @@ from config import BOT_CONFIG
 from database import (
     setup_database, check_user_exists, register_user, get_user_profile,
     register_referral, update_user_balance, get_all_users, register_transaction,
-    update_transaction_status, get_transaction_by_message_id, get_user_transactions
+    update_transaction_status, get_transaction_by_message_id, get_user_transactions,
+    get_card_info, set_card_info, get_stats
 )
 
 # تنظیم لاگینگ
@@ -91,6 +92,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username
     created_at = int(datetime.now().timestamp())
+    
+    # بررسی پارامترهای خاص در دستور start
+    if update.message and update.message.text and update.message.text.startswith('/start'):
+        message_text = update.message.text
+        
+        if "reject_" in message_text:
+            # پردازش رد پرداخت توسط ادمین
+            parts = message_text.split("reject_")[1].split("_")
+            if len(parts) >= 2:
+                payment_user_id = int(parts[0])
+                message_id = int(parts[1])
+                
+                # تنظیم وضعیت برای دریافت دلیل رد
+                context.user_data["reject_payment"] = {
+                    "user_id": payment_user_id,
+                    "message_id": message_id
+                }
+                
+                # ارسال پیام و ذخیره شناسه آن برای ویرایش بعدی
+                msg = await update.message.reply_text(
+                    "لطفاً دلیل رد پرداخت را وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="userpanel^")]
+                    ])
+                )
+                context.user_data["reject_payment"]["prompt_message_id"] = msg.message_id
+                return
+                
+        elif "custom_" in message_text:
+            # پردازش تأیید با مبلغ دلخواه
+            parts = message_text.split("custom_")[1].split("_")
+            if len(parts) >= 2:
+                payment_user_id = int(parts[0])
+                message_id = int(parts[1])
+                
+                # تنظیم وضعیت برای دریافت مبلغ دلخواه
+                context.user_data["custom_amount"] = {
+                    "user_id": payment_user_id,
+                    "message_id": message_id
+                }
+                
+                # ارسال پیام و ذخیره شناسه آن برای ویرایش بعدی
+                msg = await update.message.reply_text(
+                    "لطفاً مبلغ دلخواه را به تومان وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ لغو", callback_data="userpanel^")]
+                    ])
+                )
+                context.user_data["custom_amount"]["prompt_message_id"] = msg.message_id
+                return
     
     # بررسی عضویت در کانال
     is_member = await check_channel_membership(update, context)
@@ -404,8 +455,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ تأیید پرداخت\n\n"
             f"مبلغ {formatted_amount} تومان برای شارژ انتخاب شد.\n\n"
             f"لطفاً به شماره کارت زیر واریز کرده و سپس اسکرین‌شات رسید پرداخت خود را ارسال کنید:\n\n"
-            f"شماره کارت: 6037991521965867\n"
-            f"به نام: محمد امین چهاردولی\n\n"
+            f"شماره کارت: {BOT_CONFIG['card_number']}\n"
+            f"به نام: {BOT_CONFIG['card_holder']}\n\n"
             f"🔹 توجه: بعد از واریز، لطفاً فقط تصویر رسید پرداخت را به صورت عکس واضح ارسال کنید",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ لغو", callback_data="increasebalance^")]
@@ -413,7 +464,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         # تنظیم وضعیت گفتگو
-        context.user_data["payment_state"] = SEND_RECEIPT
+        context.user_data["payment_state"] = CONFIRM_AMOUNT
     
     elif callback_data.startswith("cancel_payment^"):
         # لغو فرآیند پرداخت
@@ -457,7 +508,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"✅ پرداخت تأیید شد\n\n"
                  f"کاربر: {payment_user_id}\n"
                  f"مبلغ: {format_number_with_commas(amount)} تومان\n"
-                 f"وضعیت: تأیید شده توسط ادمین"
+                 f"وضعیت: تأیید شده توسط ادمین",
+            reply_markup=None
         )
         
         # پاسخ به ادمین
@@ -529,15 +581,20 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif callback_data == "admin_stats^" and user_id == BOT_CONFIG["admin-username"]:
         # دریافت آمار کاربران
         try:
-            from database import get_all_users
-            users = get_all_users()
-            user_count = len(users)
+            stats = get_stats()
+            if stats:
+                stats_message = f"📊 آمار ربات {BOT_CONFIG['bot-name']}\n\n"
+                stats_message += f"👥 تعداد کل کاربران: {stats['total_users']}\n"
+                stats_message += f"👤 کاربران امروز: {stats['today_users']}\n"
+                stats_message += f"👤 کاربران دیروز: {stats['yesterday_users']}\n"
+                stats_message += f"👤 کاربران هفته گذشته: {stats['week_users']}\n"
+                stats_message += f"🤝 تعداد کل دعوت‌ها: {stats['total_referrals']}\n"
+                stats_message += f"🟢 کاربران فعال امروز (پرداخت/درخواست): {stats['active_today']}\n"
+                stats_message += f"💰 مجموع موجودی کاربران: {format_number_with_commas(stats['total_balance'])} تومان\n"
+            else:
+                stats_message = "خطا در دریافت آمار!"
             
             # ارسال آمار به ادمین
-            stats_message = f"📊 آمار ربات {BOT_CONFIG['bot-name']}\n\n"
-            stats_message += f"👥 تعداد کل کاربران: {user_count}\n"
-            
-            # ارسال پیام
             await query.edit_message_text(
                 stats_message,
                 reply_markup=InlineKeyboardMarkup([
@@ -553,6 +610,51 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
 
+    # پنل ادمین
+    elif callback_data == "admin_panel^":
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.edit_message_text(
+                "شما دسترسی به این بخش را ندارید!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
+                ])
+            )
+            return
+            
+        # ساخت منوی ادمین
+        keyboard = [
+            [InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats^")],
+            [InlineKeyboardButton("💰 مدیریت اعتبارات", callback_data="admin_credits^")],
+            [InlineKeyboardButton("💳 تغییر شماره کارت/نام کارت", callback_data="admin_cardinfo^")],
+            [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"👨‍💻 پنل مدیریت {BOT_CONFIG['bot-name']}\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
+            reply_markup=reply_markup
+        )
+
+    elif callback_data == "admin_cardinfo^":
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.edit_message_text(
+                "شما دسترسی به این بخش را ندارید!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
+                ])
+            )
+            return
+        context.user_data["awaiting_card_info"] = True
+        await query.edit_message_text(
+            f"شماره کارت فعلی: {BOT_CONFIG['card_number']}\n"
+            f"به نام: {BOT_CONFIG['card_holder']}\n\n"
+            "لطفاً شماره کارت جدید و نام صاحب کارت را به صورت زیر وارد کنید:\n"
+            "6037991521965867, محمد امین چهاردولی",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+            ])
+        )
+
 # تابع برای پردازش دستور /admin
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -566,6 +668,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats^")],
         [InlineKeyboardButton("💰 مدیریت اعتبارات", callback_data="admin_credits^")],
+        [InlineKeyboardButton("💳 تغییر شماره کارت/نام کارت", callback_data="admin_cardinfo^")],
         [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -608,9 +711,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # ذخیره مبلغ
                 user_payment_data[user_id] = {"amount": amount}
                 
+                # ویرایش پیام قبلی (درخواست مبلغ)
+                if "payment_amount_prompt_id" in context.user_data:
+                    try:
+                        await context.bot.edit_message_reply_markup(
+                            chat_id=update.effective_chat.id,
+                            message_id=context.user_data["payment_amount_prompt_id"],
+                            reply_markup=None
+                        )
+                    except Exception as e:
+                        logger.error(f"خطا در حذف دکمه پیام قبلی مبلغ: {e}")
+                
                 # نمایش تأیید مبلغ
                 formatted_amount = format_number_with_commas(amount)
-                await update.message.reply_text(
+                msg = await update.message.reply_text(
                     f"💰 تأیید مبلغ شارژ\n\n"
                     f"مبلغ وارد شده: {formatted_amount} تومان\n\n"
                     f"در صورت تأیید، روی دکمه «تأیید و پرداخت» کلیک کنید.",
@@ -619,6 +733,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("❌ لغو", callback_data="cancel_payment^")]
                     ])
                 )
+                context.user_data["payment_confirm_prompt_id"] = msg.message_id
                 
                 # تنظیم وضعیت گفتگو
                 context.user_data["payment_state"] = CONFIRM_AMOUNT
@@ -634,6 +749,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             return
         
+        elif payment_state == CONFIRM_AMOUNT:
+            # این بخش توسط callback انجام می‌شود، اما اگر نیاز بود می‌توان اینجا هم مدیریت کرد
+            pass
+        
         elif payment_state == SEND_RECEIPT:
             # دریافت رسید پرداخت
             if update.message.photo:
@@ -647,6 +766,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     amount = user_payment_data.get(user_id, {}).get("amount", 0)
                     formatted_amount = format_number_with_commas(amount)
                     logger.info(f"ارسال عکس رسید پرداخت به کانال ادمین، مبلغ: {formatted_amount}")
+                    
+                    # ویرایش پیام قبلی (تأیید مبلغ)
+                    if "payment_confirm_prompt_id" in context.user_data:
+                        try:
+                            await context.bot.edit_message_reply_markup(
+                                chat_id=update.effective_chat.id,
+                                message_id=context.user_data["payment_confirm_prompt_id"],
+                                reply_markup=None
+                            )
+                        except Exception as e:
+                            logger.error(f"خطا در حذف دکمه پیام قبلی تأیید مبلغ: {e}")
                     
                     # ارسال پیام تأیید به کاربر
                     await update.message.reply_text(
@@ -722,50 +852,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_text = update.message.text
         
         if message_text.startswith('/start'):
-            # بررسی پارامترهای خاص در دستور start
-            if "reject_" in message_text:
-                # پردازش رد پرداخت توسط ادمین
-                parts = message_text.split("reject_")[1].split("_")
-                if len(parts) >= 2:
-                    user_id = int(parts[0])
-                    message_id = int(parts[1])
-                    
-                    # تنظیم وضعیت برای دریافت دلیل رد
-                    context.user_data["reject_payment"] = {
-                        "user_id": user_id,
-                        "message_id": message_id
-                    }
-                    
-                    await update.message.reply_text(
-                        "لطفاً دلیل رد پرداخت را وارد کنید:",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ لغو", callback_data="admin_panel^")]
-                        ])
-                    )
-                    return
-                    
-            elif "custom_" in message_text:
-                # پردازش تأیید با مبلغ دلخواه
-                parts = message_text.split("custom_")[1].split("_")
-                if len(parts) >= 2:
-                    user_id = int(parts[0])
-                    message_id = int(parts[1])
-                    
-                    # تنظیم وضعیت برای دریافت مبلغ دلخواه
-                    context.user_data["custom_amount"] = {
-                        "user_id": user_id,
-                        "message_id": message_id
-                    }
-                    
-                    await update.message.reply_text(
-                        "لطفاً مبلغ دلخواه را به تومان وارد کنید:",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ لغو", callback_data="admin_panel^")]
-                        ])
-                    )
-                    return
-            
-            # اجرای دستور start معمولی
+            # اجرای دستور start که حالا پارامترها را نیز پردازش می‌کند
             await start(update, context)
         
         elif message_text.startswith('/admin'):
@@ -799,16 +886,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=f"❌ پرداخت رد شد\n\n"
                        f"کاربر: {user_id}\n"
                        f"دلیل: {reason}\n"
-                       f"وضعیت: رد شده توسط ادمین"
+                       f"وضعیت: رد شده توسط ادمین",
+                reply_markup=None
             )
+            
+            # ویرایش پیام قبلی (درخواست دلیل رد)
+            if "prompt_message_id" in reject_data:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=reject_data["prompt_message_id"],
+                        text=f"✅ دلیل رد: {reason}",
+                        reply_markup=None
+                    )
+                except Exception as e:
+                    logger.error(f"خطا در ویرایش پیام قبلی: {e}")
             
             # پاک کردن اطلاعات موقت
             del context.user_data["reject_payment"]
             
+            # ارسال پیام تأیید
             await update.message.reply_text(
                 "✅ پیام رد پرداخت با موفقیت به کاربر ارسال شد.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                    [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
                 ])
             )
         
@@ -846,16 +947,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"✅ پرداخت تأیید شد (با مبلغ دلخواه)\n\n"
                            f"کاربر: {user_id}\n"
                            f"مبلغ: {format_number_with_commas(amount)} تومان\n"
-                           f"وضعیت: تأیید شده با مبلغ دلخواه"
+                           f"وضعیت: تأیید شده با مبلغ دلخواه",
+                    reply_markup=None
                 )
+                
+                # ویرایش پیام قبلی (درخواست مبلغ دلخواه)
+                if "prompt_message_id" in custom_data:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=update.effective_chat.id,
+                            message_id=custom_data["prompt_message_id"],
+                            text=f"✅ مبلغ تأیید شده: {format_number_with_commas(amount)} تومان",
+                            reply_markup=None
+                        )
+                    except Exception as e:
+                        logger.error(f"خطا در ویرایش پیام قبلی: {e}")
                 
                 # پاک کردن اطلاعات موقت
                 del context.user_data["custom_amount"]
                 
+                # ارسال پیام تأیید
                 await update.message.reply_text(
                     f"✅ مبلغ {format_number_with_commas(amount)} تومان با موفقیت به اعتبار کاربر افزوده شد.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                        [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
                     ])
                 )
                 
@@ -868,6 +983,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ])
                 )
         
+        elif "awaiting_card_info" in context.user_data and context.user_data["awaiting_card_info"]:
+            # فقط ادمین مجاز است
+            if user_id != BOT_CONFIG["admin-username"]:
+                await update.message.reply_text("شما دسترسی به این بخش را ندارید!")
+                context.user_data.pop("awaiting_card_info", None)
+                return
+            # دریافت و اعتبارسنجی ورودی
+            parts = update.message.text.split(",")
+            if len(parts) == 2:
+                card_number = parts[0].strip()
+                card_holder = parts[1].strip()
+                BOT_CONFIG["card_number"] = card_number
+                BOT_CONFIG["card_holder"] = card_holder
+                set_card_info(card_number, card_holder)
+                context.user_data.pop("awaiting_card_info", None)
+                await update.message.reply_text(
+                    f"✅ شماره کارت و نام صاحب کارت با موفقیت به‌روزرسانی شد!\n\nشماره کارت جدید: {card_number}\nبه نام: {card_holder}",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                    ])
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ فرمت ورودی صحیح نیست! لطفاً به صورت زیر وارد کنید:\n6037991521965867, محمد امین چهاردولی",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")]
+                    ])
+                )
+            return
+        
         else:
             # پاسخ به پیام‌های نامشخص
             await update.message.reply_text("متوجه نشدم چی گفتی! لطفاً دوباره تلاش کنید. 🤔")
@@ -876,6 +1021,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     # ایجاد پایگاه داده
     setup_database()
+    
+    # خواندن شماره کارت و نام صاحب کارت از دیتابیس در صورت وجود
+    card_info = get_card_info()
+    if card_info:
+        BOT_CONFIG["card_number"] = card_info["card_number"]
+        BOT_CONFIG["card_holder"] = card_info["card_holder"]
     
     # ایجاد اپلیکیشن
     application = Application.builder().token(BOT_CONFIG["TOKEN"]).build()
