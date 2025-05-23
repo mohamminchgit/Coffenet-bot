@@ -56,6 +56,9 @@ PAYMENT_METHOD, ENTER_AMOUNT, CONFIRM_AMOUNT, SEND_RECEIPT = range(4)
  ENTER_FULLNAME, ENTER_PHONE, SELECT_ADDRESS, ENTER_NEW_ADDRESS, 
  CONFIRM_ORDER, PROCESS_PAYMENT) = range(16)
 
+# --- در ابتدای فایل (در کنار سایر مراحل گفتگو) ---
+ADD_OFFER_TITLE, ADD_OFFER_DESC, ADD_OFFER_DISCOUNT_TYPE, ADD_OFFER_DISCOUNT_AMOUNT, ADD_OFFER_DISCOUNT_PERCENT, ADD_OFFER_CONDITION, ADD_OFFER_USAGE_LIMIT = range(1001, 1008)
+
 # ذخیره اطلاعات موقت کاربر
 user_payment_data = {}
 user_print_data = {}
@@ -863,19 +866,104 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
             return
-            
         # ساخت منوی ادمین
         keyboard = [
             [InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats^")],
             [InlineKeyboardButton("💰 مدیریت اعتبارات", callback_data="admin_credits^")],
             [InlineKeyboardButton("💳 تغییر شماره کارت/نام کارت", callback_data="admin_cardinfo^")],
+            [InlineKeyboardButton("🎁 مدیریت پیشنهادات ویژه", callback_data="admin_special_offers^")],
             [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await query.edit_message_text(
             f"👨‍💻 پنل مدیریت {BOT_CONFIG['bot-name']}\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
             reply_markup=reply_markup
+        )
+
+    elif callback_data == "admin_special_offers^":
+        from database import get_all_special_offers
+        offers = get_all_special_offers()
+        msg = "🎁 مدیریت پیشنهادات ویژه:\n\n"
+        if offers:
+            for idx, offer in enumerate(offers, 1):
+                offer_id, title, description, offer_type, discount_amount, discount_percent, min_purchase, required_invites, usage_limit, is_public, is_active = offer
+                
+                # نمایش اطلاعات هر پیشنهاد با ایموجی مناسب برای وضعیت
+                status_emoji = "🟢" if is_active else "🟡"
+                status_text = "فعال" if is_active else "غیرفعال"
+                msg += f"{idx}. {title} ({status_text}) {status_emoji}\n"
+                
+                # اطلاعات تخفیف
+                if discount_amount > 0:
+                    msg += f"   💰 {format_number_with_commas(discount_amount)} تومان تخفیف\n"
+                if discount_percent > 0:
+                    msg += f"   🔻 {discount_percent}٪ تخفیف\n"
+                
+                # نوع و شرایط پیشنهاد
+                if offer_type == "invite_based":
+                    msg += f"   👥 به ازای دعوت {required_invites} نفر\n"
+                elif offer_type == "purchase_based":
+                    msg += f"   🛒 به ازای خرید {format_number_with_commas(min_purchase)} تومان\n"
+                elif offer_type == "general":
+                    msg += f"   🌐 پیشنهاد عمومی\n"
+                
+                # توضیحات
+                msg += f"   {description}\n\n"
+        else:
+            msg += "هنوز هیچ پیشنهادی ثبت نشده است."
+
+        # منوی مدیریت پیشنهادات ویژه
+        keyboards = [
+            [InlineKeyboardButton("➕ افزودن پیشنهاد جدید", callback_data="admin_add_offer_type^")]
+        ]
+        
+        # دکمه‌های ویرایش و حذف برای هر پیشنهاد
+        if offers:
+            for offer_id, _, _, _, _, _, _, _, _, _, _ in offers:
+                keyboards.append([
+                    InlineKeyboardButton(f"✏️ ویرایش پیشنهاد #{offer_id}", callback_data=f"admin_edit_offer^{offer_id}"),
+                    InlineKeyboardButton(f"❌ حذف پیشنهاد #{offer_id}", callback_data=f"admin_delete_offer^{offer_id}")
+                ])
+        
+        keyboards.append([InlineKeyboardButton("» بازگشت به پنل ادمین", callback_data="admin_panel^")])
+        
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup(keyboards)
+        )
+        
+    elif callback_data == "admin_add_offer_type^":
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.edit_message_text("شما دسترسی به این بخش را ندارید!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_special_offers^")]]))
+            return
+        
+        # انتخاب نوع پیشنهاد ویژه
+        await query.edit_message_text(
+            "لطفاً نوع پیشنهاد ویژه را انتخاب کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 پیشنهاد عمومی", callback_data="admin_create_offer^general")],
+                [InlineKeyboardButton("👥 پیشنهاد بر اساس دعوت", callback_data="admin_create_offer^invite_based")],
+                [InlineKeyboardButton("🛒 پیشنهاد بر اساس میزان خرید", callback_data="admin_create_offer^purchase_based")],
+                [InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]
+            ])
+        )
+
+    elif callback_data.startswith("admin_create_offer^"):
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.edit_message_text("شما دسترسی به این بخش را ندارید!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_special_offers^")]]))
+            return
+        
+        # دریافت نوع پیشنهاد
+        offer_type = callback_data.split("^")[1]
+        
+        # ذخیره نوع پیشنهاد در داده‌های کاربر
+        context.user_data["add_offer_state"] = ADD_OFFER_TITLE
+        context.user_data["new_offer"] = {"offer_type": offer_type}
+        
+        # ارسال پیام برای دریافت عنوان
+        await query.edit_message_text(
+            "لطفاً عنوان پیشنهاد ویژه را وارد کنید:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
         )
 
     elif callback_data == "admin_cardinfo^":
@@ -1175,10 +1263,24 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         confirm_type = callback_data.split('^')[1]
         print_data = user_print_data.get(user_id, {})
         total_price = print_data.get('total_price', 0)
+        final_price = print_data.get('final_price', total_price)  # قیمت نهایی با احتساب تخفیف
         user_profile = get_user_profile(user_id)
         user_balance = user_profile.get('balance', 0)
-        if confirm_type == 'balance' and user_balance >= total_price:
-            update_user_balance(user_id, -total_price)
+        
+        # بررسی اینکه آیا پیشنهاد ویژه‌ای انتخاب شده
+        selected_offer = print_data.get('selected_offer')
+        
+        if confirm_type == 'balance' and user_balance >= final_price:
+            # کسر هزینه از موجودی کاربر
+            update_user_balance(user_id, -final_price)
+            
+            # ثبت استفاده از پیشنهاد ویژه در صورت انتخاب شدن
+            if selected_offer:
+                from database import use_special_offer
+                offer_id = selected_offer['id']
+                use_special_offer(user_id, offer_id)
+            
+            # ثبت سفارش در پایگاه داده
             order_id = register_print_order(
                 user_id,
                 ','.join(print_data.get('file_ids', [])),
@@ -1195,7 +1297,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print_data.get('phone_number', ''),
                 print_data.get('address', ''),
                 print_data.get('description', ''),
-                total_price
+                total_price,
+                final_price,  # افزودن قیمت نهایی
+                selected_offer['id'] if selected_offer else None  # افزودن شناسه پیشنهاد استفاده شده
             )
             await query.edit_message_text("✅ سفارش شما با موفقیت ثبت شد و در حال پردازش است.")
             
@@ -1259,6 +1363,259 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
 
+    elif callback_data == "special_offers^":
+        # دریافت پیشنهادات ویژه فعال عمومی و اختصاصی کاربر
+        from database import get_user_eligible_offers
+        offers = get_user_eligible_offers(user_id)
+        
+        msg = "🏄 پیشنهادات ویژه شما:\n\n"
+        
+        if offers:
+            for idx, offer in enumerate(offers, 1):
+                # اضافه کردن ایموجی دایره سبز کنار عنوان پیشنهاد
+                msg += f"{idx}. {offer['title']} 🟢\n"
+                if offer['discount_amount'] > 0:
+                    msg += f"   💰 {format_number_with_commas(offer['discount_amount'])} تومان تخفیف\n"
+                if offer['discount_percent'] > 0:
+                    msg += f"   🔻 {offer['discount_percent']}٪ تخفیف\n"
+                
+                # نمایش تعداد استفاده باقیمانده
+                remaining_uses = offer['usage_limit'] - offer['usage_count']
+                msg += f"   🔄 {remaining_uses} بار قابل استفاده\n"
+                
+                # توضیحات
+                msg += f"   {offer['description']}\n\n"
+        else:
+            msg += "در حال حاضر هیچ پیشنهاد ویژه‌ای برای شما فعال نیست."
+        
+        # اضافه کردن دکمه برای استفاده از پیشنهادات در سفارش بعدی
+        buttons = [[InlineKeyboardButton("» بازگشت", callback_data="club^")]]
+        if offers:
+            buttons.insert(0, [InlineKeyboardButton("🛒 ثبت سفارش با استفاده از پیشنهادات", callback_data="print_request^")])
+        
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif callback_data == "admin_add_special_offer^":
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.edit_message_text("شما دسترسی به این بخش را ندارید!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت", callback_data="admin_special_offers^")]]))
+            return
+        context.user_data["add_offer_state"] = ADD_OFFER_TITLE
+        await query.edit_message_text(
+            "لطفاً عنوان پیشنهاد ویژه را وارد کنید:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+        )
+        return
+
+    # پردازش انتخاب نوع تخفیف برای پیشنهاد ویژه
+    elif callback_data.startswith("offer_discount_type^"):
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.answer("شما دسترسی به این بخش را ندارید.", show_alert=True)
+            return
+        
+        discount_type = callback_data.split("^")[1]
+        
+        if discount_type == "amount":
+            # تخفیف مبلغی ثابت
+            context.user_data["add_offer_state"] = ADD_OFFER_DISCOUNT_AMOUNT
+            await query.edit_message_text(
+                "لطفاً مبلغ تخفیف را به تومان وارد کنید (فقط عدد):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+            )
+        else:
+            # تخفیف درصدی
+            context.user_data["add_offer_state"] = ADD_OFFER_DISCOUNT_PERCENT
+            await query.edit_message_text(
+                "لطفاً درصد تخفیف را وارد کنید (عدد بین 1 تا 100):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+            )
+        return
+    
+    # پردازش حذف پیشنهاد ویژه
+    elif callback_data.startswith("admin_delete_offer^"):
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.answer("شما دسترسی به این بخش را ندارید.", show_alert=True)
+            return
+        
+        offer_id = int(callback_data.split("^")[1])
+        from database import update_special_offer
+        
+        # غیرفعال کردن پیشنهاد به جای حذف فیزیکی
+        if update_special_offer(offer_id, is_active=0):
+            await query.answer("پیشنهاد ویژه با موفقیت حذف شد.", show_alert=True)
+            
+            # ارسال پیام جدید به جای ویرایش پیام قبلی
+            await query.message.reply_text(
+                "✅ پیشنهاد ویژه با موفقیت غیرفعال شد.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به لیست پیشنهادات", callback_data="admin_special_offers^")]
+                ])
+            )
+        else:
+            await query.answer("خطا در حذف پیشنهاد ویژه. لطفاً دوباره تلاش کنید.", show_alert=True)
+        return
+
+    # انتخاب پیشنهاد ویژه برای سفارش
+    elif callback_data.startswith("select_special_offer^"):
+        from database import get_user_eligible_offers, calculate_discount
+        
+        if callback_data == "select_special_offer^":
+            # نمایش لیست پیشنهادات
+            offers = get_user_eligible_offers(user_id)
+            
+            if not offers:
+                await query.answer("در حال حاضر هیچ پیشنهاد ویژه‌ای برای شما فعال نیست.", show_alert=True)
+                return
+            
+            msg = "🎁 انتخاب پیشنهاد ویژه:\n\n"
+            msg += "لطفاً یکی از پیشنهادات ویژه زیر را برای اعمال بر سفارش خود انتخاب کنید:"
+            
+            keyboard = []
+            for offer in offers:
+                # ساخت توضیح کوتاه برای هر پیشنهاد
+                offer_desc = offer['title']
+                if offer['discount_amount'] > 0:
+                    offer_desc += f" ({format_number_with_commas(offer['discount_amount'])} تومان تخفیف)"
+                if offer['discount_percent'] > 0:
+                    offer_desc += f" ({offer['discount_percent']}٪ تخفیف)"
+                
+                keyboard.append([InlineKeyboardButton(offer_desc, callback_data=f"select_special_offer^{offer['id']}")])
+            
+            keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="continue_without_offer^")])
+            
+            await query.edit_message_text(
+                msg,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        else:
+            # انتخاب پیشنهاد خاص
+            offer_id = int(callback_data.split("^")[1])
+            offers = get_user_eligible_offers(user_id)
+            
+            # یافتن پیشنهاد مورد نظر
+            selected_offer = None
+            for offer in offers:
+                if offer['id'] == offer_id:
+                    selected_offer = offer
+                    break
+            
+            if not selected_offer:
+                await query.answer("پیشنهاد ویژه انتخابی معتبر نیست.", show_alert=True)
+                return
+            
+            # محاسبه میزان تخفیف
+            total_price = user_print_data[user_id].get("total_price", 0)
+            discount_amount = calculate_discount(total_price, offer_id)
+            
+            # ذخیره اطلاعات پیشنهاد در داده‌های سفارش
+            user_print_data[user_id]["selected_offer"] = selected_offer
+            user_print_data[user_id]["discount_amount"] = discount_amount
+            
+            # نمایش مجدد صفحه تأیید سفارش با اعمال تخفیف
+            await show_order_confirmation(update, context, user_id)
+            
+            return
+    
+    # ادامه بدون استفاده از پیشنهاد ویژه
+    elif callback_data == "continue_without_offer^":
+        # حذف پیشنهاد ویژه انتخاب شده در صورت وجود
+        if "selected_offer" in user_print_data.get(user_id, {}):
+            del user_print_data[user_id]["selected_offer"]
+        if "discount_amount" in user_print_data.get(user_id, {}):
+            del user_print_data[user_id]["discount_amount"]
+        
+        # نمایش مجدد صفحه تأیید سفارش
+        await show_order_confirmation(update, context, user_id)
+        
+        return
+
+    elif callback_data.startswith("admin_edit_offer^"):
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.answer("شما دسترسی به این بخش را ندارید.", show_alert=True)
+            return
+        
+        offer_id = int(callback_data.split("^")[1])
+        from database import get_all_special_offers
+        
+        # دریافت اطلاعات پیشنهاد ویژه
+        offers = get_all_special_offers()
+        selected_offer = None
+        for offer in offers:
+            if offer[0] == offer_id:
+                selected_offer = offer
+                break
+        
+        if not selected_offer:
+            await query.answer("پیشنهاد ویژه مورد نظر یافت نشد.", show_alert=True)
+            return
+        
+        # نمایش اطلاعات پیشنهاد برای ویرایش
+        offer_id, title, description, offer_type, discount_amount, discount_percent, min_purchase, required_invites, usage_limit, is_public, is_active = selected_offer
+        
+        offer_type_text = {
+            "general": "عمومی",
+            "invite_based": "بر اساس دعوت",
+            "purchase_based": "بر اساس خرید"
+        }.get(offer_type, "نامشخص")
+        
+        # تعیین ایموجی وضعیت
+        status_emoji = "🟢" if is_active else "🟡"
+        
+        # ارسال پیام جدید با اطلاعات پیشنهاد
+        await query.message.reply_text(
+            f"✏️ ویرایش پیشنهاد #{offer_id}\n\n"
+            f"🔹 عنوان: {title}\n"
+            f"🔹 توضیحات: {description}\n"
+            f"🔹 نوع پیشنهاد: {offer_type_text}\n"
+            f"🔹 مبلغ تخفیف: {format_number_with_commas(discount_amount)} تومان\n"
+            f"🔹 درصد تخفیف: {discount_percent}٪\n"
+            f"🔹 حداقل خرید: {format_number_with_commas(min_purchase)} تومان\n"
+            f"🔹 تعداد دعوت لازم: {required_invites}\n"
+            f"🔹 محدودیت استفاده: {usage_limit} بار\n"
+            f"🔹 وضعیت: {'فعال' if is_active else 'غیرفعال'} {status_emoji}\n\n"
+            "برای ویرایش هر بخش، روی دکمه‌های زیر کلیک کنید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ ویرایش عنوان", callback_data=f"edit_offer_title^{offer_id}")],
+                [InlineKeyboardButton("✏️ ویرایش توضیحات", callback_data=f"edit_offer_desc^{offer_id}")],
+                [InlineKeyboardButton("✏️ ویرایش مبلغ تخفیف", callback_data=f"edit_offer_amount^{offer_id}")],
+                [InlineKeyboardButton("✏️ ویرایش درصد تخفیف", callback_data=f"edit_offer_percent^{offer_id}")],
+                [InlineKeyboardButton("🔄 تغییر وضعیت فعال/غیرفعال", callback_data=f"toggle_offer_status^{offer_id}^{1 if not is_active else 0}")],
+                [InlineKeyboardButton("» بازگشت به لیست پیشنهادات", callback_data="admin_special_offers^")]
+            ])
+        )
+        return
+        
+    elif callback_data.startswith("toggle_offer_status^"):
+        if user_id != BOT_CONFIG["admin-username"]:
+            await query.answer("شما دسترسی به این بخش را ندارید.", show_alert=True)
+            return
+        
+        parts = callback_data.split("^")
+        offer_id = int(parts[1])
+        new_status = int(parts[2])
+        
+        from database import update_special_offer
+        
+        # به‌روزرسانی وضعیت پیشنهاد
+        if update_special_offer(offer_id, is_active=new_status):
+            status_text = "فعال" if new_status == 1 else "غیرفعال"
+            await query.answer(f"وضعیت پیشنهاد به {status_text} تغییر یافت.", show_alert=True)
+            
+            # ارسال پیام جدید
+            await query.message.reply_text(
+                f"✅ وضعیت پیشنهاد #{offer_id} با موفقیت به {status_text} تغییر یافت.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("» بازگشت به لیست پیشنهادات", callback_data="admin_special_offers^")]
+                ])
+            )
+        else:
+            await query.answer("خطا در تغییر وضعیت پیشنهاد. لطفاً دوباره تلاش کنید.", show_alert=True)
+        return
+
 # تابع برای پردازش دستور /admin
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1273,10 +1630,10 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 آمار کاربران", callback_data="admin_stats^")],
         [InlineKeyboardButton("💰 مدیریت اعتبارات", callback_data="admin_credits^")],
         [InlineKeyboardButton("💳 تغییر شماره کارت/نام کارت", callback_data="admin_cardinfo^")],
+        [InlineKeyboardButton("🎁 مدیریت پیشنهادات ویژه", callback_data="admin_special_offers^")],
         [InlineKeyboardButton("» بازگشت به منوی اصلی", callback_data="userpanel^")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(
         f"👨‍💻 پنل مدیریت {BOT_CONFIG['bot-name']}\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
         reply_markup=reply_markup
@@ -1773,6 +2130,176 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif message_text.startswith('/admin'):
             await admin_command(update, context)
         
+        # بررسی افزودن پیشنهاد ویژه توسط ادمین (اول این شرط را بررسی می‌کنیم)
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_TITLE:
+            title = update.message.text.strip()
+            context.user_data["new_offer"]["title"] = title
+            context.user_data["add_offer_state"] = ADD_OFFER_DESC
+            await update.message.reply_text(
+                "عنوان ثبت شد. حالا توضیح پیشنهاد ویژه را وارد کنید:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+            )
+            return
+            
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_DESC:
+            desc = update.message.text.strip()
+            context.user_data["new_offer"]["description"] = desc
+            context.user_data["add_offer_state"] = ADD_OFFER_DISCOUNT_TYPE
+            
+            # درخواست نوع تخفیف
+            await update.message.reply_text(
+                "نوع تخفیف را انتخاب کنید:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 تخفیف مبلغی", callback_data="offer_discount_type^amount")],
+                    [InlineKeyboardButton("🔻 تخفیف درصدی", callback_data="offer_discount_type^percent")],
+                    [InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]
+                ])
+            )
+            return
+        
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_DISCOUNT_AMOUNT:
+            amount_text = update.message.text.strip().replace(",", "").replace("،", "")
+            try:
+                amount = int(amount_text)
+                if amount <= 0:
+                    raise ValueError("مبلغ باید بزرگتر از صفر باشد")
+                
+                context.user_data["new_offer"]["discount_amount"] = amount
+                
+                # بررسی نوع پیشنهاد برای ادامه مسیر
+                offer_type = context.user_data["new_offer"].get("offer_type")
+                if offer_type == "invite_based":
+                    context.user_data["add_offer_state"] = ADD_OFFER_CONDITION
+                    await update.message.reply_text(
+                        "تعداد دعوت لازم برای فعال‌سازی پیشنهاد را وارد کنید (عدد):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+                elif offer_type == "purchase_based":
+                    context.user_data["add_offer_state"] = ADD_OFFER_CONDITION
+                    await update.message.reply_text(
+                        "حداقل مبلغ خرید برای فعال‌سازی پیشنهاد را وارد کنید (به تومان):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+                else:
+                    # پیشنهاد عمومی نیاز به شرط ندارد
+                    context.user_data["add_offer_state"] = ADD_OFFER_USAGE_LIMIT
+                    await update.message.reply_text(
+                        "تعداد دفعات مجاز استفاده از این پیشنهاد را وارد کنید (عدد):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+            except ValueError as e:
+                await update.message.reply_text(
+                    f"خطا: {str(e)}. لطفاً یک عدد معتبر وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                )
+            return
+        
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_DISCOUNT_PERCENT:
+            try:
+                percent = int(update.message.text.strip())
+                if percent <= 0 or percent > 100:
+                    raise ValueError("درصد تخفیف باید بین 1 تا 100 باشد")
+                
+                context.user_data["new_offer"]["discount_percent"] = percent
+                
+                # بررسی نوع پیشنهاد برای ادامه مسیر
+                offer_type = context.user_data["new_offer"].get("offer_type")
+                if offer_type == "invite_based":
+                    context.user_data["add_offer_state"] = ADD_OFFER_CONDITION
+                    await update.message.reply_text(
+                        "تعداد دعوت لازم برای فعال‌سازی پیشنهاد را وارد کنید (عدد):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+                elif offer_type == "purchase_based":
+                    context.user_data["add_offer_state"] = ADD_OFFER_CONDITION
+                    await update.message.reply_text(
+                        "حداقل مبلغ خرید برای فعال‌سازی پیشنهاد را وارد کنید (به تومان):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+                else:
+                    # پیشنهاد عمومی نیاز به شرط ندارد
+                    context.user_data["add_offer_state"] = ADD_OFFER_USAGE_LIMIT
+                    await update.message.reply_text(
+                        "تعداد دفعات مجاز استفاده از این پیشنهاد را وارد کنید (عدد):",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                    )
+            except ValueError as e:
+                await update.message.reply_text(
+                    f"خطا: {str(e)}. لطفاً یک عدد معتبر وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                )
+            return
+        
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_CONDITION:
+            offer_type = context.user_data["new_offer"].get("offer_type")
+            try:
+                value = int(update.message.text.strip().replace(",", "").replace("،", ""))
+                if value <= 0:
+                    raise ValueError("مقدار باید بزرگتر از صفر باشد")
+                
+                if offer_type == "invite_based":
+                    context.user_data["new_offer"]["required_invites"] = value
+                elif offer_type == "purchase_based":
+                    context.user_data["new_offer"]["min_purchase_amount"] = value
+                
+                # حالا تعداد دفعات مجاز استفاده را بپرسیم
+                context.user_data["add_offer_state"] = ADD_OFFER_USAGE_LIMIT
+                await update.message.reply_text(
+                    "تعداد دفعات مجاز استفاده از این پیشنهاد را وارد کنید (عدد):",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                )
+            except ValueError as e:
+                await update.message.reply_text(
+                    f"خطا: {str(e)}. لطفاً یک عدد معتبر وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                )
+            return
+        
+        elif context.user_data.get("add_offer_state") == ADD_OFFER_USAGE_LIMIT:
+            try:
+                usage_limit = int(update.message.text.strip())
+                if usage_limit <= 0:
+                    raise ValueError("تعداد دفعات مجاز باید بزرگتر از صفر باشد")
+                
+                # ذخیره تعداد دفعات مجاز
+                context.user_data["new_offer"]["usage_limit"] = usage_limit
+                
+                # تمام اطلاعات جمع‌آوری شده، پیشنهاد را ایجاد می‌کنیم
+                from database import add_special_offer
+                
+                new_offer = context.user_data["new_offer"]
+                offer_id = add_special_offer(
+                    title=new_offer.get("title"),
+                    description=new_offer.get("description"),
+                    offer_type=new_offer.get("offer_type"),
+                    discount_amount=new_offer.get("discount_amount", 0),
+                    discount_percent=new_offer.get("discount_percent", 0),
+                    min_purchase_amount=new_offer.get("min_purchase_amount", 0),
+                    required_invites=new_offer.get("required_invites", 0),
+                    usage_limit=new_offer.get("usage_limit", 1)
+                )
+                
+                # پاک کردن داده‌های موقت
+                context.user_data.pop("add_offer_state", None)
+                context.user_data.pop("new_offer", None)
+                
+                if offer_id:
+                    await update.message.reply_text(
+                        "✅ پیشنهاد ویژه با موفقیت ایجاد شد!",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت به مدیریت پیشنهادات", callback_data="admin_special_offers^")]])
+                    )
+                else:
+                    await update.message.reply_text(
+                        "❌ خطا در ایجاد پیشنهاد ویژه. لطفاً دوباره تلاش کنید.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("» بازگشت به مدیریت پیشنهادات", callback_data="admin_special_offers^")]])
+                    )
+            except ValueError as e:
+                await update.message.reply_text(
+                    f"خطا: {str(e)}. لطفاً یک عدد معتبر وارد کنید:",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin_special_offers^")]])
+                )
+            return
+        
         elif "reject_payment" in context.user_data:
             # پردازش دلیل رد پرداخت
             reject_data = context.user_data["reject_payment"]
@@ -1928,9 +2455,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         
+        # اگر نوع پیام با هیچ حالتی مطابقت نداشت، به پیام‌های نامشخص پاسخ می‌دهیم
         else:
             # پاسخ به پیام‌های نامشخص
             await update.message.reply_text("متوجه نشدم چی گفتی! لطفاً دوباره تلاش کنید. 🤔")
+            return
 
 # تابع برای دانلود فایل از تلگرام
 async def download_telegram_file(context, file_id, custom_filename=None):
@@ -2057,7 +2586,7 @@ async def calculate_print_price(print_data):
         logger.error(f"خطا در محاسبه قیمت پرینت: {e}")
         return 0
 
-# تابع برای نمایش تأیید نهایی سفارش
+# تابع نمایش تأیید سفارش با پشتیبانی از پیشنهادات ویژه
 async def show_order_confirmation(update, context, user_id):
     try:
         # دریافت اطلاعات سفارش
@@ -2068,6 +2597,10 @@ async def show_order_confirmation(update, context, user_id):
         # محاسبه قیمت کل
         total_price = await calculate_print_price(print_data)
         print_data["total_price"] = total_price
+        
+        # دریافت پیشنهادات ویژه قابل استفاده
+        from database import get_user_eligible_offers
+        eligible_offers = get_user_eligible_offers(user_id)
         
         # ساخت متن تأیید سفارش
         confirmation_text = "📋 خلاصه سفارش شما:\n\n"
@@ -2122,6 +2655,21 @@ async def show_order_confirmation(update, context, user_id):
         formatted_price = format_number_with_commas(total_price)
         confirmation_text += f"\n💰 قیمت کل: {formatted_price} تومان"
         
+        # اطلاعات پیشنهاد ویژه اگر از قبل انتخاب شده باشد
+        if print_data.get("selected_offer"):
+            offer = print_data.get("selected_offer")
+            discount_amount = print_data.get("discount_amount", 0)
+            formatted_discount = format_number_with_commas(discount_amount)
+            final_price = total_price - discount_amount
+            formatted_final_price = format_number_with_commas(final_price)
+            
+            confirmation_text += f"\n\n🎁 پیشنهاد ویژه: {offer.get('title')}"
+            confirmation_text += f"\n💵 میزان تخفیف: {formatted_discount} تومان"
+            confirmation_text += f"\n💰 قیمت نهایی: {formatted_final_price} تومان"
+            
+            # به‌روزرسانی قیمت نهایی برای محاسبات بعدی
+            print_data["final_price"] = final_price
+        
         # دریافت موجودی کاربر
         user_profile = get_user_profile(user_id)
         user_balance = user_profile.get("balance", 0)
@@ -2130,8 +2678,11 @@ async def show_order_confirmation(update, context, user_id):
         # اضافه کردن اطلاعات موجودی
         confirmation_text += f"\n💳 موجودی شما: {formatted_balance} تومان"
         
+        # استفاده از قیمت نهایی با احتساب تخفیف در صورت وجود
+        final_price = print_data.get("final_price", total_price)
+        
         # بررسی کافی بودن موجودی
-        if user_balance >= total_price:
+        if user_balance >= final_price:
             confirmation_text += "\n\n✅ موجودی شما برای این سفارش کافی است."
             
             # دکمه‌های تأیید و لغو
@@ -2141,7 +2692,7 @@ async def show_order_confirmation(update, context, user_id):
             ]
         else:
             # محاسبه مبلغ کسری
-            shortage = total_price - user_balance
+            shortage = final_price - user_balance
             formatted_shortage = format_number_with_commas(shortage)
             
             confirmation_text += f"\n\n❌ موجودی شما برای این سفارش کافی نیست. شما به {formatted_shortage} تومان دیگر نیاز دارید."
@@ -2154,6 +2705,10 @@ async def show_order_confirmation(update, context, user_id):
             
             keyboard.append([InlineKeyboardButton("💳 افزایش موجودی", callback_data="confirm_order^increase")])
             keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="serviceslist^")])
+        
+        # اضافه کردن دکمه پیشنهادات ویژه اگر از قبل انتخاب نشده و پیشنهاد وجود دارد
+        if not print_data.get("selected_offer") and eligible_offers:
+            keyboard.insert(0, [InlineKeyboardButton("🎁 استفاده از پیشنهاد ویژه", callback_data="select_special_offer^")])
         
         # ارسال پیام تأیید
         if isinstance(update, Update):

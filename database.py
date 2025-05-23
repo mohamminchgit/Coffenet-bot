@@ -135,6 +135,8 @@ def setup_database():
             address TEXT,
             description TEXT,
             total_price INTEGER,
+            final_price INTEGER DEFAULT NULL,
+            offer_id INTEGER DEFAULT NULL,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -969,28 +971,73 @@ def get_user_addresses(user_id):
 # تابع برای ثبت سفارش پرینت
 def register_print_order(user_id, file_ids, file_type, page_count, page_range, print_type, print_method,
                         paper_size, paper_type, staple, delivery_type, full_name, phone_number, address,
-                        description, total_price):
+                        description, total_price, final_price=None, offer_id=None):
+    """
+    ثبت سفارش پرینت در پایگاه داده
+    
+    Args:
+        user_id: شناسه کاربر
+        file_ids: شناسه فایل‌ها با کاما جدا شده
+        file_type: نوع فایل (pdf, docx, image, ...)
+        page_count: تعداد صفحات
+        page_range: محدوده صفحات
+        print_type: نوع چاپ (رنگی یا سیاه و سفید)
+        print_method: روش چاپ (یک رو یا دو رو)
+        paper_size: اندازه کاغذ
+        paper_type: نوع کاغذ
+        staple: منگنه (0 یا 1)
+        delivery_type: نوع تحویل (حضوری یا پیک)
+        full_name: نام و نام خانوادگی
+        phone_number: شماره تماس
+        address: آدرس (برای تحویل با پیک)
+        description: توضیحات
+        total_price: قیمت کل قبل از تخفیف
+        final_price: قیمت نهایی پس از تخفیف
+        offer_id: شناسه پیشنهاد ویژه استفاده شده
+        
+    Returns:
+        int: شناسه سفارش یا None در صورت خطا
+    """
     try:
+        now = int(datetime.now().timestamp())
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        # اضافه کردن ستون‌های جدید به جدول print_orders در صورت نیاز
+        try:
+            cursor.execute("SELECT final_price FROM print_orders LIMIT 1")
+        except sqlite3.OperationalError:
+            # ستون‌های مورد نیاز وجود ندارند، آنها را اضافه می‌کنیم
+            cursor.execute("ALTER TABLE print_orders ADD COLUMN final_price INTEGER DEFAULT NULL")
+            cursor.execute("ALTER TABLE print_orders ADD COLUMN offer_id INTEGER DEFAULT NULL")
+            conn.commit()
+        
         cursor.execute('''
-        INSERT INTO print_orders (
-            user_id, file_ids, file_type, page_count, page_range, print_type, print_method,
-            paper_size, paper_type, staple, delivery_type, full_name, phone_number, address,
-            description, total_price, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO print_orders (
+                user_id, file_ids, file_type, page_count, page_range, print_type, print_method,
+                paper_size, paper_type, staple, delivery_type, full_name, phone_number, 
+                address, description, total_price, final_price, offer_id, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             user_id, file_ids, file_type, page_count, page_range, print_type, print_method,
-            paper_size, paper_type, staple, delivery_type, full_name, phone_number, address,
-            description, total_price
+            paper_size, paper_type, staple, delivery_type, full_name, phone_number, 
+            address, description, total_price, final_price or total_price, offer_id, 'pending', now
         ))
         
         order_id = cursor.lastrowid
+        
+        # به‌روزرسانی اطلاعات کاربر
+        if full_name and phone_number:
+            cursor.execute('''
+                UPDATE users 
+                SET phone_number = ? 
+                WHERE user_id = ? AND (phone_number IS NULL OR phone_number = '')
+            ''', (phone_number, user_id))
+        
         conn.commit()
         conn.close()
         
-        logger.info(f"سفارش پرینت جدید با شناسه {order_id} برای کاربر {user_id} ثبت شد")
+        logger.info(f"سفارش پرینت جدید با شناسه {order_id} ثبت شد")
         return order_id
     except Exception as e:
         logger.error(f"خطا در ثبت سفارش پرینت: {e}")
@@ -1130,4 +1177,498 @@ def check_user_info_exists(user_id):
         return None
     except Exception as e:
         logger.error(f"خطا در بررسی وجود اطلاعات کاربر: {e}")
-        return None 
+        return None
+
+# --- مدیریت پیشنهادات ویژه ---
+
+def add_special_offer(title, description, offer_type='general', discount_amount=0, discount_percent=0, 
+                     min_purchase_amount=0, required_invites=0, usage_limit=1, is_public=1, is_active=1, expires_at=None):
+    """
+    افزودن پیشنهاد ویژه جدید
+    
+    Args:
+        title (str): عنوان پیشنهاد
+        description (str): توضیحات پیشنهاد
+        offer_type (str): نوع پیشنهاد (general, invite_based, purchase_based)
+        discount_amount (int): مبلغ تخفیف (به تومان)
+        discount_percent (int): درصد تخفیف (0-100)
+        min_purchase_amount (int): حداقل مبلغ خرید برای فعال‌سازی (به تومان)
+        required_invites (int): تعداد دعوت لازم برای فعال‌سازی
+        usage_limit (int): تعداد دفعات مجاز استفاده
+        is_public (int): آیا برای همه کاربران قابل مشاهده است
+        is_active (int): وضعیت فعال بودن
+        expires_at (int): تاریخ انقضا (timestamp)
+        
+    Returns:
+        int: شناسه پیشنهاد ویژه یا None در صورت خطا
+    """
+    try:
+        now = int(datetime.now().timestamp())
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # بررسی وجود جدول special_offers
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='special_offers'")
+        if not cursor.fetchone():
+            # ایجاد جدول اگر وجود نداشته باشد
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS special_offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    offer_type TEXT NOT NULL,
+                    discount_amount INTEGER DEFAULT 0,
+                    discount_percent INTEGER DEFAULT 0,
+                    min_purchase_amount INTEGER DEFAULT 0,
+                    required_invites INTEGER DEFAULT 0,
+                    usage_limit INTEGER DEFAULT 1,
+                    is_public INTEGER DEFAULT 1,
+                    is_active INTEGER DEFAULT 1,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    expires_at INTEGER
+                )
+            ''')
+            conn.commit()
+            logger.info("جدول special_offers ایجاد شد")
+        
+        # درج رکورد جدید
+        cursor.execute('''
+            INSERT INTO special_offers (
+                title, description, offer_type, discount_amount, discount_percent, 
+                min_purchase_amount, required_invites, usage_limit, is_public, 
+                is_active, created_at, updated_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            title, description, offer_type, discount_amount, discount_percent, 
+            min_purchase_amount, required_invites, usage_limit, is_public, 
+            is_active, now, now, expires_at
+        ))
+        
+        # دریافت شناسه رکورد جدید
+        offer_id = cursor.lastrowid
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"پیشنهاد ویژه جدید با شناسه {offer_id} اضافه شد")
+        return offer_id
+    except Exception as e:
+        logger.error(f"خطا در افزودن پیشنهاد ویژه: {e}")
+        return None
+
+def update_special_offer(offer_id, title=None, description=None, offer_type=None, 
+                        discount_amount=None, discount_percent=None, min_purchase_amount=None, 
+                        required_invites=None, usage_limit=None, is_public=None, is_active=None, expires_at=None):
+    """
+    به‌روزرسانی پیشنهاد ویژه موجود
+    """
+    try:
+        now = int(datetime.now().timestamp())
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # ساخت کوئری به‌روزرسانی بر اساس فیلدهای موجود
+        update_fields = []
+        values = []
+        
+        if title is not None:
+            update_fields.append("title = ?")
+            values.append(title)
+        
+        if description is not None:
+            update_fields.append("description = ?")
+            values.append(description)
+        
+        if offer_type is not None:
+            update_fields.append("offer_type = ?")
+            values.append(offer_type)
+        
+        if discount_amount is not None:
+            update_fields.append("discount_amount = ?")
+            values.append(discount_amount)
+        
+        if discount_percent is not None:
+            update_fields.append("discount_percent = ?")
+            values.append(discount_percent)
+        
+        if min_purchase_amount is not None:
+            update_fields.append("min_purchase_amount = ?")
+            values.append(min_purchase_amount)
+        
+        if required_invites is not None:
+            update_fields.append("required_invites = ?")
+            values.append(required_invites)
+        
+        if usage_limit is not None:
+            update_fields.append("usage_limit = ?")
+            values.append(usage_limit)
+        
+        if is_public is not None:
+            update_fields.append("is_public = ?")
+            values.append(is_public)
+        
+        if is_active is not None:
+            update_fields.append("is_active = ?")
+            values.append(is_active)
+        
+        if expires_at is not None:
+            update_fields.append("expires_at = ?")
+            values.append(expires_at)
+        
+        # اضافه کردن فیلد updated_at
+        update_fields.append("updated_at = ?")
+        values.append(now)
+        
+        # اضافه کردن شناسه پیشنهاد به پارامترها
+        values.append(offer_id)
+        
+        # اجرای کوئری به‌روزرسانی
+        if update_fields:
+            query = f"UPDATE special_offers SET {', '.join(update_fields)} WHERE id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+        
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"خطا در به‌روزرسانی پیشنهاد ویژه: {e}")
+        return False
+
+def assign_special_offer_to_user(user_id, offer_id, is_active=1):
+    """
+    اختصاص پیشنهاد ویژه به کاربر
+    """
+    try:
+        now = int(datetime.now().timestamp())
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # بررسی وجود جدول user_special_offers
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_special_offers'")
+        if not cursor.fetchone():
+            # ایجاد جدول اگر وجود نداشته باشد
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_special_offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    offer_id INTEGER NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    usage_count INTEGER DEFAULT 0,
+                    assigned_at INTEGER,
+                    last_used_at INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    FOREIGN KEY (offer_id) REFERENCES special_offers (id)
+                )
+            ''')
+            conn.commit()
+        
+        # بررسی وجود رکورد قبلی برای این کاربر و پیشنهاد
+        cursor.execute('SELECT id FROM user_special_offers WHERE user_id = ? AND offer_id = ?', (user_id, offer_id))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # به‌روزرسانی رکورد موجود
+            cursor.execute('''
+                UPDATE user_special_offers 
+                SET is_active = ?, assigned_at = ? 
+                WHERE user_id = ? AND offer_id = ?
+            ''', (is_active, now, user_id, offer_id))
+        else:
+            # درج رکورد جدید
+            cursor.execute('''
+                INSERT INTO user_special_offers (user_id, offer_id, is_active, usage_count, assigned_at)
+                VALUES (?, ?, ?, 0, ?)
+            ''', (user_id, offer_id, is_active, now))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"خطا در اختصاص پیشنهاد ویژه به کاربر: {e}")
+        return False
+
+def set_user_special_offer_active(user_id, offer_id, is_active):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE user_special_offers SET is_active = ? WHERE user_id = ? AND offer_id = ?
+        ''', (is_active, user_id, offer_id))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"خطا در فعال/غیرفعال کردن پیشنهاد ویژه کاربر: {e}")
+        return False
+
+def get_active_special_offers():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, title, description FROM special_offers WHERE is_active = 1
+        ''')
+        offers = cursor.fetchall()
+        conn.close()
+        return offers
+    except Exception as e:
+        logger.error(f"خطا در دریافت پیشنهادات ویژه فعال: {e}")
+        return []
+
+def get_user_special_offers(user_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT so.id, so.title, so.description FROM user_special_offers uso
+            JOIN special_offers so ON uso.offer_id = so.id
+            WHERE uso.user_id = ? AND uso.is_active = 1 AND so.is_active = 1
+        ''', (user_id,))
+        offers = cursor.fetchall()
+        conn.close()
+        return offers
+    except Exception as e:
+        logger.error(f"خطا در دریافت پیشنهادات ویژه کاربر: {e}")
+        return []
+
+def get_all_special_offers():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''SELECT id, title, description, offer_type, discount_amount, discount_percent, 
+                          min_purchase_amount, required_invites, usage_limit, is_public, is_active 
+                          FROM special_offers ORDER BY created_at DESC''')
+        offers = cursor.fetchall()
+        conn.close()
+        return offers
+    except Exception as e:
+        logger.error(f"خطا در دریافت همه پیشنهادات ویژه: {e}")
+        return []
+
+def get_user_eligible_offers(user_id):
+    """
+    دریافت پیشنهادات ویژه که کاربر شرایط استفاده از آنها را دارد
+    
+    Args:
+        user_id (int): شناسه کاربر
+        
+    Returns:
+        list: لیست پیشنهادات قابل استفاده
+    """
+    try:
+        now = int(datetime.now().timestamp())
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # دریافت پیشنهادات عمومی فعال
+        public_offers = []
+        cursor.execute('''
+            SELECT id, title, description, offer_type, discount_amount, discount_percent, 
+                   min_purchase_amount, required_invites, usage_limit
+            FROM special_offers 
+            WHERE is_active = 1 AND is_public = 1 
+                  AND (expires_at IS NULL OR expires_at > ?)
+        ''', (now,))
+        public_offers = cursor.fetchall()
+        
+        # دریافت پیشنهادات اختصاصی فعال کاربر
+        cursor.execute('''
+            SELECT o.id, o.title, o.description, o.offer_type, o.discount_amount, o.discount_percent, 
+                   o.min_purchase_amount, o.required_invites, o.usage_limit, uo.usage_count
+            FROM special_offers o
+            JOIN user_special_offers uo ON o.id = uo.offer_id
+            WHERE uo.user_id = ? AND uo.is_active = 1 AND o.is_active = 1
+                  AND (o.expires_at IS NULL OR o.expires_at > ?)
+        ''', (user_id, now))
+        user_offers = cursor.fetchall()
+        
+        # برای هر پیشنهاد، بررسی کنیم آیا کاربر شرایط استفاده دارد
+        eligible_offers = []
+        
+        # بررسی پیشنهادات عمومی
+        for offer in public_offers:
+            (offer_id, title, description, offer_type, discount_amount, 
+             discount_percent, min_purchase_amount, required_invites, usage_limit) = offer
+            
+            # بررسی شرایط پیشنهاد
+            if offer_type == 'invite_based':
+                # بررسی تعداد دعوت‌ها
+                cursor.execute('''
+                    SELECT COUNT(*) FROM referrals WHERE inviter_user_id = ?
+                ''', (user_id,))
+                invite_count = cursor.fetchone()[0]
+                
+                if invite_count >= required_invites:
+                    eligible_offers.append({
+                        'id': offer_id,
+                        'title': title,
+                        'description': description,
+                        'offer_type': offer_type,
+                        'discount_amount': discount_amount,
+                        'discount_percent': discount_percent,
+                        'is_public': 1,
+                        'usage_count': 0,
+                        'usage_limit': usage_limit
+                    })
+            
+            elif offer_type == 'purchase_based':
+                # بررسی مجموع خریدها
+                cursor.execute('''
+                    SELECT SUM(total_price) FROM print_orders 
+                    WHERE user_id = ? AND status = 'completed'
+                ''', (user_id,))
+                total_purchase = cursor.fetchone()[0] or 0
+                
+                if total_purchase >= min_purchase_amount:
+                    eligible_offers.append({
+                        'id': offer_id,
+                        'title': title,
+                        'description': description,
+                        'offer_type': offer_type,
+                        'discount_amount': discount_amount,
+                        'discount_percent': discount_percent,
+                        'is_public': 1,
+                        'usage_count': 0,
+                        'usage_limit': usage_limit
+                    })
+            
+            elif offer_type == 'general':
+                # پیشنهاد عمومی بدون شرط
+                eligible_offers.append({
+                    'id': offer_id,
+                    'title': title,
+                    'description': description,
+                    'offer_type': offer_type,
+                    'discount_amount': discount_amount,
+                    'discount_percent': discount_percent,
+                    'is_public': 1,
+                    'usage_count': 0,
+                    'usage_limit': usage_limit
+                })
+        
+        # بررسی پیشنهادات اختصاصی کاربر
+        for offer in user_offers:
+            (offer_id, title, description, offer_type, discount_amount, 
+             discount_percent, min_purchase_amount, required_invites, usage_limit, usage_count) = offer
+            
+            # بررسی تعداد استفاده‌ها
+            if usage_count < usage_limit:
+                eligible_offers.append({
+                    'id': offer_id,
+                    'title': title,
+                    'description': description,
+                    'offer_type': offer_type,
+                    'discount_amount': discount_amount,
+                    'discount_percent': discount_percent,
+                    'is_public': 0,
+                    'usage_count': usage_count,
+                    'usage_limit': usage_limit
+                })
+        
+        conn.close()
+        return eligible_offers
+    except Exception as e:
+        logger.error(f"خطا در دریافت پیشنهادات ویژه قابل استفاده: {e}")
+        return []
+
+def use_special_offer(user_id, offer_id):
+    """
+    استفاده کاربر از پیشنهاد ویژه
+    
+    Args:
+        user_id (int): شناسه کاربر
+        offer_id (int): شناسه پیشنهاد ویژه
+        
+    Returns:
+        bool: True در صورت موفقیت، False در صورت خطا
+    """
+    try:
+        now = int(datetime.now().timestamp())
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # بررسی وجود رکورد قبلی برای این کاربر و پیشنهاد
+        cursor.execute('SELECT id, usage_count FROM user_special_offers WHERE user_id = ? AND offer_id = ?', (user_id, offer_id))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # به‌روزرسانی رکورد موجود
+            user_offer_id, usage_count = existing
+            cursor.execute('''
+                UPDATE user_special_offers 
+                SET usage_count = ?, last_used_at = ? 
+                WHERE id = ?
+            ''', (usage_count + 1, now, user_offer_id))
+        else:
+            # بررسی آیا پیشنهاد عمومی است
+            cursor.execute('SELECT is_public FROM special_offers WHERE id = ?', (offer_id,))
+            offer = cursor.fetchone()
+            
+            if offer and offer[0] == 1:
+                # ایجاد رکورد جدید برای پیشنهاد عمومی
+                cursor.execute('''
+                    INSERT INTO user_special_offers (user_id, offer_id, is_active, usage_count, assigned_at, last_used_at)
+                    VALUES (?, ?, 1, 1, ?, ?)
+                ''', (user_id, offer_id, now, now))
+            else:
+                # پیشنهاد عمومی نیست و کاربر رکوردی ندارد
+                conn.close()
+                return False
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"خطا در استفاده از پیشنهاد ویژه: {e}")
+        return False
+
+def calculate_discount(total_price, offer_id):
+    """
+    محاسبه مبلغ تخفیف براساس پیشنهاد ویژه
+    
+    Args:
+        total_price (int): مبلغ کل سفارش (به تومان)
+        offer_id (int): شناسه پیشنهاد ویژه
+        
+    Returns:
+        int: مبلغ تخفیف (به تومان)
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # دریافت اطلاعات پیشنهاد
+        cursor.execute('''
+            SELECT discount_amount, discount_percent 
+            FROM special_offers 
+            WHERE id = ? AND is_active = 1
+        ''', (offer_id,))
+        
+        offer = cursor.fetchone()
+        conn.close()
+        
+        if not offer:
+            return 0
+        
+        discount_amount, discount_percent = offer
+        
+        # محاسبه تخفیف
+        calculated_discount = 0
+        
+        # تخفیف مبلغی ثابت
+        if discount_amount > 0:
+            calculated_discount = discount_amount
+        
+        # تخفیف درصدی
+        if discount_percent > 0:
+            calculated_discount = int(total_price * discount_percent / 100)
+        
+        # اگر تخفیف بیشتر از مبلغ کل باشد، به اندازه مبلغ کل تخفیف می‌دهیم
+        if calculated_discount > total_price:
+            calculated_discount = total_price
+        
+        return calculated_discount
+    except Exception as e:
+        logger.error(f"خطا در محاسبه تخفیف: {e}")
+        return 0 
